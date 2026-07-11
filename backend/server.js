@@ -1,566 +1,942 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
-const { load, save } = require('./db');
-const { register, login, authenticate } = require('./auth');
+const {
+  CredentialError,
+  DEV_OTP_CODE,
+  OtpError,
+  authenticate,
+  createToken,
+  hashPassword,
+  loginAttemptLimiter,
+  otpService,
+  pendingRegistrationService,
+  verifyPassword,
+} = require('./auth');
+const { DatabaseError, load, update } = require('./db');
+const {
+  DEMO_DATA_NOTICE,
+  categories,
+  demoProducts,
+  getCommunitySummary,
+  getProductById,
+  getProductWithCommunity,
+  getReviewsForProduct,
+} = require('./demo-fixtures');
+const {
+  calculateLifespanDetails,
+  calculatePersonalPurchaseScore,
+} = require('./scoring');
+const {
+  ValidationError,
+  maskPhoneNumber,
+  parseCatalogQuery,
+  parsePositiveIntegerId,
+  validateLogin,
+  validateOtpRequest,
+  validateOtpVerification,
+  validateOwnershipCreate,
+  validateOwnershipPatch,
+  validateRegistrationStart,
+  validateRegistrationVerification,
+} = require('./validation');
 
-const app = express();
+const DEFAULT_PORT = 3001;
+const DEFAULT_ORIGIN = 'http://localhost:3000';
 
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
+function getAllowedOrigins() {
+  return (process.env.APP_ORIGIN || DEFAULT_ORIGIN)
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
 
-app.use(express.json());
-
-const PORT = 3001;
-
-// Auth routes
-app.post('/api/register', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const result = await register(email, password);
-    res.json(result);
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
-
-app.post('/api/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const result = await login(email, password);
-    res.json(result);
-  } catch (e) {
-    res.status(401).json({ error: e.message });
-  }
-});
-
-// Inventory CRUD (protected)
-app.get('/api/inventory', authenticate, (req, res) => {
-  const db = load();
-  const items = db.inventory.filter(i => i.userId === req.userId);
-  res.json(items);
-});
-
-app.post('/api/inventory', authenticate, (req, res) => {
-  const { name, category, purchaseDate, expectedLifespan, condition } = req.body;
-  if (!name || !category || !purchaseDate || !expectedLifespan) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-  const db = load();
-  const item = {
-    id: db.nextItemId++,
-    userId: req.userId,
-    name,
-    category,
-    purchase_date: purchaseDate,
-    expected_lifespan: Number(expectedLifespan),
-    condition: condition || 'Good',
-    created_at: new Date().toISOString()
+function demoMeta(extra = {}) {
+  return {
+    isDemoData: true,
+    notice: DEMO_DATA_NOTICE,
+    ...extra,
   };
-  db.inventory.push(item);
-  save(db);
-  res.json({ id: item.id });
-});
-
-app.delete('/api/inventory/:id', authenticate, (req, res) => {
-  const db = load();
-  const idx = db.inventory.findIndex(i => i.id === Number(req.params.id) && i.userId === req.userId);
-  if (idx === -1) return res.status(404).json({ error: 'Item not found' });
-  db.inventory.splice(idx, 1);
-  save(db);
-  res.json({ success: true });
-});
-
-let browserInstance = null;
-
-async function getBrowser() {
-  if (!browserInstance || !browserInstance.connected) {
-    browserInstance = await puppeteer.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
-  }
-  return browserInstance;
 }
 
-async function searchRedditReviews(productName) {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+function sendError(res, status, code, message, details = null) {
+  const error = { code, message };
+  if (details !== null) error.details = details;
+  return res.status(status).json({ error });
+}
 
-  try {
-    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
+function requireJson(req, res, next) {
+  if (!req.is('application/json')) {
+    return sendError(
+      res,
+      415,
+      'unsupported_media_type',
+      'Content-Type must be application/json.'
+    );
+  }
+  return next();
+}
 
-    const query = encodeURIComponent(`${productName} review`);
-    await page.goto(`https://www.reddit.com/search/?q=${query}&type=link&sort=relevance`, {
-      waitUntil: 'networkidle2',
-      timeout: 15000
-    });
+function requireActiveLocalUser(req, res, next) {
+  const data = load();
+  const user = data.users.find(
+    (candidate) => String(candidate.id) === String(req.userId)
+  );
 
-    await new Promise(r => setTimeout(r, 2000));
+  if (!user || user.phoneVerified !== true) {
+    return sendError(
+      res,
+      401,
+      'local_user_not_found',
+      'The local-development user no longer exists.'
+    );
+  }
+  if ((user.accountStatus || 'active') !== 'active') {
+    return sendError(
+      res,
+      403,
+      'account_not_active',
+      'This account is not active.'
+    );
+  }
+  req.localUser = user;
+  return next();
+}
 
-    const posts = await page.evaluate(() => {
-      const results = [];
-      const seen = new Set();
+function publicUser(user) {
+  const result = {
+    id: user.id,
+    email: user.email || null,
+    username: user.username || null,
+    displayName: user.displayName || user.username || `WorthIt? member ${user.id}`,
+    phoneVerified: user.phoneVerified === true,
+    role: user.role || 'user',
+    accountStatus: user.accountStatus || 'active',
+    createdAt: user.createdAt,
+  };
+  if (typeof user.phone === 'string') {
+    result.maskedPhone = maskPhoneNumber(user.phone);
+  }
+  return result;
+}
 
-      document.querySelectorAll('a[href*="/comments/"]').forEach(a => {
-        const href = a.href;
-        const text = a.textContent.trim();
-        if (text.length > 10 && !seen.has(href) && !href.includes('/comment/')) {
-          seen.add(href);
-          const subredditMatch = href.match(/\/r\/([^/]+)/);
-          results.push({
-            title: text,
-            url: href,
-            subreddit: subredditMatch ? subredditMatch[1] : 'unknown'
-          });
-        }
-      });
-      return results;
-    });
+function findRegistrationConflict(data, registration) {
+  if (
+    data.users.some(
+      (user) =>
+        typeof user.email === 'string' &&
+        user.email.toLowerCase() === registration.email
+    )
+  ) {
+    return 'email';
+  }
+  if (
+    data.users.some(
+      (user) =>
+        typeof user.username === 'string' &&
+        user.username.toLowerCase() === registration.username
+    )
+  ) {
+    return 'username';
+  }
+  if (data.users.some((user) => user.phone === registration.phone)) {
+    return 'phone';
+  }
+  return null;
+}
 
-    const reviews = [];
-    for (const post of posts.slice(0, 6)) {
-      const { snippet, score } = await scrapePost(page, post.url);
-      const fullText = post.title + ' ' + snippet;
-      const sentiment = analyzeSentiment(fullText);
+function throwRegistrationConflict(field) {
+  throw new CredentialError(`That ${field} is already registered.`, {
+    status: 409,
+    code: 'account_already_exists',
+    details: { field },
+  });
+}
 
-      reviews.push({
-        title: post.title,
-        subreddit: post.subreddit,
-        score,
-        url: post.url,
-        snippet,
-        sentiment
-      });
+function validateProductId(value) {
+  if (
+    typeof value !== 'string' ||
+    value.length > 80 ||
+    !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value)
+  ) {
+    throw new ValidationError('Product id is invalid.', 'id');
+  }
+  return value;
+}
+
+function sortCatalog(products, sort) {
+  const sorted = [...products];
+  const numberOr = (value, fallback) =>
+    Number.isFinite(value) ? value : fallback;
+
+  sorted.sort((left, right) => {
+    let comparison = 0;
+
+    switch (sort) {
+      case 'most-reviewed':
+        comparison = right.reviewCount - left.reviewCount;
+        break;
+      case 'highest-rated':
+        comparison =
+          numberOr(right.communityRating, -1) -
+          numberOr(left.communityRating, -1);
+        break;
+      case 'recently-added':
+        comparison = new Date(right.createdAt) - new Date(left.createdAt);
+        break;
+      case 'newest-release':
+        comparison = new Date(right.releaseDate) - new Date(left.releaseDate);
+        break;
+      case 'longest-lifespan':
+        comparison =
+          right.expectedLifespanMonths - left.expectedLifespanMonths;
+        break;
+      case 'most-saved':
+        comparison = right.demoSavedCount - left.demoSavedCount;
+        break;
+      case 'trending':
+      default:
+        comparison = left.trendingRank - right.trendingRank;
+        break;
     }
 
-    await page.close();
-
-    const avgSentiment = reviews.length > 0
-      ? reviews.reduce((sum, r) => sum + r.sentiment, 0) / reviews.length
-      : 3.0;
-
-    return { reviews, rating: Math.round(avgSentiment * 10) / 10 };
-  } catch (error) {
-    console.error('Reddit search error:', error.message);
-    await page.close().catch(() => {});
-    return { reviews: [], rating: 3.0 };
-  }
+    return comparison || left.name.localeCompare(right.name);
+  });
+  return sorted;
 }
 
-async function scrapePost(page, postUrl) {
-  try {
-    await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 10000 });
-    await new Promise(r => setTimeout(r, 1500));
+function queryCatalog(filters) {
+  const normalizedQuery = filters.q.toLowerCase();
+  let products = demoProducts.map(getProductWithCommunity);
 
-    const result = await page.evaluate(() => {
-      let snippet = '';
-
-      const bodySelectors = [
-        '[data-testid="post-content"] [id*="post-rtjson"]',
-        '[slot="text-body"]',
-        'div[data-click-id="text"]',
-        '.Post .RichTextJSON-root',
-        'shreddit-post [slot="text-body"]',
-      ];
-
-      for (const sel of bodySelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim().length > 20) {
-          snippet = el.textContent.trim();
-          break;
-        }
-      }
-
-      if (!snippet) {
-        const comments = document.querySelectorAll('[id*="comment-content"] p, [data-testid="comment"] p');
-        const texts = [];
-        comments.forEach((c, i) => {
-          if (i < 3 && c.textContent.trim().length > 20) {
-            texts.push(c.textContent.trim());
-          }
-        });
-        snippet = texts.join(' ');
-      }
-
-      let score = null;
-      const scoreEl = document.querySelector('shreddit-post');
-      if (scoreEl) {
-        const s = scoreEl.getAttribute('score');
-        if (s) score = parseInt(s);
-      }
-
-      return { snippet: snippet.replace(/\s+/g, ' ').replace(/Read more$/i, '').trim(), score };
-    });
-
-    return {
-      snippet: (result.snippet || '').slice(0, 250),
-      score: result.score || Math.floor(Math.random() * 300) + 10
-    };
-  } catch (e) {
-    return { snippet: '', score: Math.floor(Math.random() * 300) + 10 };
+  if (normalizedQuery) {
+    products = products.filter((product) =>
+      [
+        product.name,
+        product.brand,
+        product.model,
+        product.categoryId,
+        product.categoryLabel,
+        product.summary,
+      ]
+        .join(' ')
+        .toLowerCase()
+        .includes(normalizedQuery)
+    );
   }
+  if (filters.category) {
+    products = products.filter(
+      (product) => product.categoryId === filters.category
+    );
+  }
+  if (filters.minPrice !== undefined) {
+    products = products.filter(
+      (product) => product.currentPrice >= filters.minPrice
+    );
+  }
+  if (filters.maxPrice !== undefined) {
+    products = products.filter(
+      (product) => product.currentPrice <= filters.maxPrice
+    );
+  }
+  if (filters.minRating !== undefined) {
+    products = products.filter(
+      (product) =>
+        product.communityRating !== null &&
+        product.communityRating >= filters.minRating
+    );
+  }
+  if (filters.minReviews !== undefined) {
+    products = products.filter(
+      (product) => product.reviewCount >= filters.minReviews
+    );
+  }
+  if (filters.minLifespanMonths !== undefined) {
+    products = products.filter(
+      (product) =>
+        product.expectedLifespanMonths >= filters.minLifespanMonths
+    );
+  }
+  if (filters.minRepairability !== undefined) {
+    products = products.filter(
+      (product) => product.repairabilityRating >= filters.minRepairability
+    );
+  }
+
+  const sorted = sortCatalog(products, filters.sort);
+  const total = sorted.length;
+  return {
+    products: sorted.slice(filters.offset, filters.offset + filters.limit),
+    total,
+  };
 }
 
-async function searchAlternatives(productName) {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-
-  try {
-    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
-
-    // Search for posts about alternatives/recommendations
-    const query = encodeURIComponent(`${productName} alternative OR cheaper OR budget OR instead OR recommend`);
-    await page.goto(`https://www.reddit.com/search/?q=${query}&type=link&sort=relevance`, {
-      waitUntil: 'networkidle2',
-      timeout: 15000
-    });
-
-    await new Promise(r => setTimeout(r, 2000));
-
-    const posts = await page.evaluate(() => {
-      const results = [];
-      const seen = new Set();
-
-      document.querySelectorAll('a[href*="/comments/"]').forEach(a => {
-        const href = a.href;
-        const text = a.textContent.trim();
-        if (text.length > 10 && !seen.has(href) && !href.includes('/comment/')) {
-          seen.add(href);
-          const subredditMatch = href.match(/\/r\/([^/]+)/);
-          results.push({
-            title: text,
-            url: href,
-            subreddit: subredditMatch ? subredditMatch[1] : 'unknown'
-          });
-        }
-      });
-      return results;
-    });
-
-    // Visit top posts and scrape alternatives from their comments
-    const allAlternatives = [];
-    for (const post of posts.slice(0, 4)) {
-      const alts = await scrapeAlternativesFromComments(page, post.url, post.subreddit, productName);
-      allAlternatives.push(...alts);
-    }
-
-    await page.close();
-
-    const deduplicated = deduplicateAlternatives(allAlternatives, productName);
-    return deduplicated.slice(0, 5);
-  } catch (error) {
-    console.error('Alternatives search error:', error.message);
-    await page.close().catch(() => {});
-    return [];
-  }
-}
-
-async function scrapeAlternativesFromComments(page, postUrl, subreddit, productName) {
-  try {
-    await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 10000 });
-    await new Promise(r => setTimeout(r, 2000));
-
-    const alternatives = await page.evaluate((originalProduct) => {
-      const results = [];
-      const seen = new Set();
-      const originalWords = originalProduct.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-
-      // Get all comment text and post body
-      const commentEls = document.querySelectorAll(
-        '[id*="comment-content"] p, [data-testid="comment"] p, .Comment p, [slot="text-body"] p, div[data-click-id="text"] p, shreddit-comment [slot="comment-body"] p, .md p'
+function getSubstitutes(product, limit = 3) {
+  return demoProducts
+    .filter(
+      (candidate) =>
+        candidate.id !== product.id &&
+        candidate.categoryId === product.categoryId
+    )
+    .map(getProductWithCommunity)
+    .sort((left, right) => {
+      const ratingDifference =
+        (right.communityRating || 0) - (left.communityRating || 0);
+      return (
+        ratingDifference ||
+        right.expectedLifespanMonths - left.expectedLifespanMonths
       );
-
-      const allText = [];
-      commentEls.forEach(el => {
-        const text = el.textContent.trim();
-        if (text.length > 15) allText.push(text);
-      });
-
-      const fullText = allText.join('\n');
-
-      // Pattern: Brand + Model (e.g. "Keychron M6", "Rapoo M750s", "Sennheiser HD 450BT", "Bose QC45")
-      // Brand = capitalized word 3+ chars, Model = alphanumeric with at least one digit somewhere
-      const brandModelPattern = /\b([A-Z][a-z]{2,})\s+([A-Z]?[A-Za-z]*\d[A-Za-z0-9]*(?:[\s-][A-Z0-9][A-Za-z0-9]*)*)\b/g;
-      let match;
-      while ((match = brandModelPattern.exec(fullText)) !== null) {
-        const brand = match[1];
-        let model = match[2].trim();
-        // Truncate model after 3 words max
-        const modelWords = model.split(/[\s-]+/);
-        if (modelWords.length > 3) model = modelWords.slice(0, 3).join(' ');
-        const name = `${brand} ${model}`;
-        const nameLower = name.toLowerCase();
-
-        if (name.length < 5 || name.length > 35) continue;
-        // Only reject if the FULL original product name overlaps significantly
-        const origNorm = originalProduct.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const nameNorm = nameLower.replace(/[^a-z0-9]/g, '');
-        if (origNorm === nameNorm) continue;
-        // Reject if ALL major words (4+ chars) from name exist in original
-        const nameMainWords = nameLower.split(/\s+/).filter(w => w.length >= 4);
-        const origMainWords = originalProduct.toLowerCase().split(/\s+/).filter(w => w.length >= 4);
-        if (nameMainWords.length > 0 && nameMainWords.every(w => origMainWords.some(o => o.includes(w) || w.includes(o)))) continue;
-
-        if (seen.has(nameNorm)) continue;
-        // Brand must not be a common English word
-        const skipBrands = ['about', 'after', 'before', 'since', 'while', 'where', 'there', 'these', 'those', 'would', 'could', 'should', 'might', 'maybe', 'every', 'other', 'under', 'over', 'still', 'never', 'being', 'doing', 'going', 'having', 'using', 'making'];
-        if (skipBrands.includes(brand.toLowerCase())) continue;
-
-        // Get context
-        const idx = match.index;
-        const contextStart = Math.max(0, idx - 40);
-        const contextEnd = Math.min(fullText.length, idx + name.length + 100);
-        const context = fullText.slice(contextStart, contextEnd).replace(/\n/g, ' ');
-        const contextLower = context.toLowerCase();
-
-        const isRecommendation = /recommend|suggest|try|check out|look at|go with|switched|better|cheaper|alternative|instead|budget|great|good|love|amazing|worth|similar|option|solid|prefer|upgrade|downgrade|compare|bang for|value/i.test(contextLower);
-        const isSecondhand = /used|second.?hand|refurbished|pre.?owned|marketplace|swap|ebay|craigslist/i.test(contextLower);
-
-        if (isRecommendation || isSecondhand) {
-          seen.add(nameNorm);
-          results.push({
-            name,
-            context: context.trim(),
-            type: isSecondhand ? 'Second-hand' : 'Cheaper Alternative'
-          });
-        }
-      }
-
-      // Pattern 2: "recommend/try/check out the [Product Name]"
-      const recPattern = /(?:recommend|suggest|try|check out|go with|switched to|went with|look at|consider)\s+(?:the\s+)?([A-Z][a-zA-Z0-9]+(?:[\s-]+[A-Z0-9][A-Za-z0-9]*){1,2})/g;
-      while ((match = recPattern.exec(fullText)) !== null) {
-        let name = match[1].trim();
-        const nameLower = name.toLowerCase();
-
-        // Strip at "or"/"and" to split multi-product mentions
-        name = name.split(/\s+(?:or|and|\/)\s+/)[0].trim();
-
-        if (name.length < 4 || name.length > 35) continue;
-        if (originalWords.some(w => name.toLowerCase().includes(w))) continue;
-        if (seen.has(name.toLowerCase().replace(/\s+/g, ''))) continue;
-
-        // Must have a number or at least 2 capitals
-        const hasNum = /\d/.test(name);
-        const caps = (name.match(/[A-Z]/g) || []).length;
-        if (!hasNum && caps < 2) continue;
-
-        // Reject common phrases
-        const words = name.split(/\s+/);
-        const skipFirst = ['the', 'this', 'that', 'it', 'they', 'my', 'your', 'some', 'just', 'one', 'about', 'after', 'while', 'where'];
-        if (skipFirst.includes(words[0].toLowerCase())) continue;
-
-        const idx = match.index;
-        const contextEnd = Math.min(fullText.length, idx + match[0].length + 80);
-        const context = fullText.slice(idx, contextEnd).replace(/\n/g, ' ');
-
-        seen.add(name.toLowerCase().replace(/\s+/g, ''));
-        results.push({
-          name,
-          context: context.trim(),
-          type: 'Cheaper Alternative'
-        });
-      }
-
-      return results;
-    }, productName);
-
-    return alternatives.map(alt => ({
-      name: alt.name,
-      source: `r/${subreddit}`,
-      url: postUrl,
-      reason: alt.context.slice(0, 140),
-      type: alt.type
+    })
+    .slice(0, limit)
+    .map((candidate) => ({
+      ...candidate,
+      reason:
+        candidate.expectedLifespanMonths > product.expectedLifespanMonths
+          ? 'Same demo category with a longer stated expected lifespan.'
+          : 'Same demo category with community-written demonstration reviews.',
     }));
-  } catch (e) {
-    return [];
-  }
 }
 
-function cleanProductName(name) {
-  let cleaned = name.trim();
-  // Strip trailing common English words that aren't part of product names
-  // Apply repeatedly to peel off trailing junk one word at a time
-  const junkTrail = /\s+(is|are|was|were|for|the|and|but|or|to|in|on|at|of|so|as|if|it|my|be|do|no|up|by|we|he|me|am|has|had|can|may|not|yet|also|just|seem|might|could|would|should|currently|basically|instead|which|that|this|with|from|than|been|very|really|quite|pretty)\s*$/i;
-  for (let i = 0; i < 5; i++) {
-    const before = cleaned;
-    cleaned = cleaned.replace(junkTrail, '').trim();
-    if (cleaned === before) break;
-  }
-  // Strip leading "the"
-  cleaned = cleaned.replace(/^the\s+/i, '');
-  return cleaned;
+function getUserOwnedItems(userId) {
+  return load().ownedItems.filter(
+    (item) => String(item.userId) === String(userId)
+  );
 }
 
-function deduplicateAlternatives(alternatives, productName) {
-  const seen = new Set();
-  const productLower = productName.toLowerCase();
-  const junkPatterns = /^(the|this|that|edit|update|buy|get|want|haiku|just|like|also|my|its|your|some|one|two|new|old|big|let|may|any|all|how|why|but|not|yet|did|office|am|so)\b/i;
-  const nonProductWords = ['battle', 'sing', 'reddit', 'comment', 'post', 'thread', 'subreddit', 'karma', 'award', 'upvote', 'downvote', 'deleted', 'removed', 'moderator', 'admin'];
+function enrichOwnedItem(item, asOfDate = new Date()) {
+  const product = item.productId ? getProductById(item.productId) : null;
+  let lifespan = null;
+  let lifespanError = null;
 
-  return alternatives.map(alt => ({ ...alt, name: cleanProductName(alt.name) })).filter(alt => {
-    if (!alt.name || alt.name.length < 4) return false;
-    const key = alt.name.toLowerCase().replace(/\s+/g, ' ').trim();
-    if (seen.has(key)) return false;
-    // Check if a very similar key already exists (e.g. "Keychron M6" vs "Keychron m6")
-    const normalized = key.replace(/[^a-z0-9]/g, '');
-    for (const s of seen) {
-      if (s.replace(/[^a-z0-9]/g, '') === normalized) return false;
-    }
-    if (productLower.split(' ').some(w => w.length > 3 && key.includes(w))) return false;
-    if (junkPatterns.test(alt.name)) return false;
-    if (nonProductWords.some(w => key.includes(w))) return false;
-    // Must start with a capital and contain a number or multiple capitals
-    const hasNum = /\d/.test(alt.name);
-    const capCount = (alt.name.match(/[A-Z]/g) || []).length;
-    const looksLikeProduct = /^[A-Z]/.test(alt.name) && (hasNum || capCount >= 2);
-    if (!looksLikeProduct) return false;
-    // Reject if it looks like a sentence fragment
-    const commonWords = ['for', 'the', 'and', 'but', 'with', 'that', 'this', 'from', 'have', 'are', 'was', 'were', 'been', 'will', 'just', 'like', 'also', 'feel', 'wait', 'want', 'need', 'seem', 'look', 'what', 'would', 'replace'];
-    const nameWords = alt.name.toLowerCase().split(/\s+/);
-    const commonCount = nameWords.filter(w => commonWords.includes(w)).length;
-    if (commonCount >= 2 || (commonCount >= 1 && nameWords.length <= 2)) return false;
-    // Filter if the reason/context doesn't seem product-related
-    const reasonLower = alt.reason.toLowerCase();
-    const hasProductContext = /mouse|keyboard|headphone|monitor|speaker|phone|laptop|tablet|camera|earb|audio|wireless|bluetooth|usb|ergonomic|click|scroll|switch|alternative|budget|cheaper|better|quality|recommend|comfortable|weight|sensor|dpi|battery|charge|silent|quiet|noise|sound|build|price|worth|value|option/i.test(reasonLower);
-    if (!hasProductContext) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function analyzeSentiment(text) {
-  const lower = text.toLowerCase();
-  const positiveWords = ['great', 'excellent', 'amazing', 'love', 'best', 'perfect', 'awesome', 'fantastic', 'recommend', 'worth', 'solid', 'reliable', 'quality', 'happy', 'impressed', 'good', 'nice', 'wonderful', 'comfortable', 'upgrade', 'better', 'favorite', 'incredible', 'superb'];
-  const negativeWords = ['bad', 'terrible', 'awful', 'hate', 'worst', 'broke', 'cheap', 'waste', 'disappointing', 'regret', 'avoid', 'garbage', 'junk', 'poor', 'horrible', 'defective', 'returned', 'refund', 'overpriced', 'uncomfortable', 'downgrade', 'flimsy', 'issue', 'problem', 'broken', 'disappointed'];
-
-  let posCount = 0;
-  let negCount = 0;
-
-  for (const word of positiveWords) {
-    if (lower.includes(word)) posCount++;
+  try {
+    lifespan = calculateLifespanDetails(item, asOfDate);
+  } catch (error) {
+    lifespanError = error.message;
   }
-  for (const word of negativeWords) {
-    if (lower.includes(word)) negCount++;
-  }
-
-  const total = posCount + negCount;
-  if (total === 0) return 3.0;
-  const ratio = posCount / total;
-  return Math.round((ratio * 4 + 1) * 10) / 10;
-}
-
-function calculateInventoryRating(product, inventory) {
-  const productWords = product.toLowerCase().split(/\s+/);
-
-  const similarItems = inventory.filter(item => {
-    const itemWords = item.name.toLowerCase().split(/\s+/);
-    const categoryMatch = item.category && productWords.some(w => item.category.toLowerCase().includes(w));
-    const nameMatch = productWords.some(w => w.length > 2 && itemWords.some(iw => iw.includes(w) || w.includes(iw)));
-    return categoryMatch || nameMatch;
-  });
-
-  const similarCount = similarItems.length;
-  let avgOwnership = 0;
-  let avgLifespanRatio = 0;
-
-  if (similarItems.length > 0) {
-    const totalOwnership = similarItems.reduce((sum, item) => {
-      const owned = (Date.now() - new Date(item.purchaseDate).getTime()) / (1000 * 60 * 60 * 24 * 30);
-      return sum + owned;
-    }, 0);
-    avgOwnership = totalOwnership / similarItems.length;
-
-    const totalLifespanRatio = similarItems.reduce((sum, item) => {
-      const owned = (Date.now() - new Date(item.purchaseDate).getTime()) / (1000 * 60 * 60 * 24 * 30);
-      return sum + (owned / item.expectedLifespan);
-    }, 0);
-    avgLifespanRatio = totalLifespanRatio / similarItems.length;
-  }
-
-  const countScore = Math.min(5, (similarCount / 3) * 5);
-  const ownershipScore = Math.min(5, (avgOwnership / 24) * 5);
-  const lifespanScore = avgLifespanRatio > 0 ? Math.max(0, (1 - avgLifespanRatio) * 5) : 2.5;
-
-  const overall = similarCount > 0
-    ? (countScore * 0.3 + ownershipScore * 0.3 + lifespanScore * 0.4)
-    : 1.0;
 
   return {
-    overall: Math.max(1, Math.min(5, Math.round(overall * 10) / 10)),
-    breakdown: {
-      similarItems: similarCount,
-      countScore: Math.round(countScore * 10) / 10,
-      ownershipMonths: Math.round(avgOwnership * 10) / 10,
-      ownershipScore: Math.round(ownershipScore * 10) / 10,
-      lifespanRatio: Math.round(avgLifespanRatio * 100),
-      lifespanScore: Math.round(Math.max(0, lifespanScore) * 10) / 10
-    }
+    ...item,
+    productName: item.productName || product?.name || 'Unknown product',
+    categoryId: item.categoryId || product?.categoryId || null,
+    product: product ? getProductWithCommunity(product) : null,
+    lifespan,
+    lifespanError,
   };
 }
 
-app.post('/api/search', authenticate, async (req, res) => {
-  const { productName } = req.body;
-  if (!productName) return res.status(400).json({ error: 'Product name required' });
+function createApp() {
+  const app = express();
+  app.disable('x-powered-by');
 
-  const db = load();
-  const inventory = db.inventory.filter(i => i.userId === req.userId).map(item => ({
-    name: item.name,
-    category: item.category,
-    purchaseDate: item.purchase_date,
-    expectedLifespan: item.expected_lifespan,
-    condition: item.condition
-  }));
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
 
-  try {
-    const [redditData, alternatives] = await Promise.all([
-      searchRedditReviews(productName),
-      searchAlternatives(productName)
-    ]);
+    const origin = req.headers.origin;
+    const allowedOrigins = getAllowedOrigins();
+    const originAllowed =
+      !origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin);
 
-    let finalAlternatives = alternatives;
-    if (finalAlternatives.length < 5 && redditData.reviews.length > 0) {
-      const browser = await getBrowser();
-      const page = await browser.newPage();
-      await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
-
-      for (const review of redditData.reviews.slice(0, 3)) {
-        if (finalAlternatives.length >= 5) break;
-        const moreAlts = await scrapeAlternativesFromComments(page, review.url, review.subreddit, productName);
-        const cleaned = deduplicateAlternatives([...finalAlternatives, ...moreAlts], productName);
-        finalAlternatives = cleaned;
-      }
-      await page.close();
+    if (!originAllowed) {
+      return sendError(
+        res,
+        403,
+        'origin_not_allowed',
+        'This browser origin is not allowed to call the API.'
+      );
     }
+    if (origin) {
+      res.setHeader(
+        'Access-Control-Allow-Origin',
+        allowedOrigins.includes('*') ? '*' : origin
+      );
+      res.setHeader('Vary', 'Origin');
+    }
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET, POST, PATCH, DELETE, OPTIONS'
+    );
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization'
+    );
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    return next();
+  });
 
-    const inventoryRating = calculateInventoryRating(productName, inventory);
+  app.use(express.json({ limit: '32kb', strict: true }));
+
+  app.get('/api/health', (req, res) => {
+    res.json({
+      status: 'ok',
+      service: 'WorthIt? local-development API',
+      dataMode: 'demonstration-fixtures',
+      productionReady: false,
+    });
+  });
+
+  app.get('/api/categories', (req, res) => {
+    res.json({ meta: demoMeta(), categories });
+  });
+
+  app.get('/api/catalog', (req, res) => {
+    const filters = parseCatalogQuery(
+      req.query,
+      categories.map((category) => category.id)
+    );
+    const result = queryCatalog(filters);
 
     res.json({
-      product: productName,
-      redditReviews: redditData.reviews,
-      redditRating: redditData.rating,
-      inventoryRating,
-      alternatives: finalAlternatives.slice(0, 5)
+      meta: demoMeta({
+        total: result.total,
+        limit: filters.limit,
+        offset: filters.offset,
+      }),
+      filters,
+      products: result.products,
     });
-  } catch (error) {
-    console.error('Search error:', error);
-    res.status(500).json({ error: 'Failed to search for product' });
+  });
+
+  app.get('/api/search', (req, res) => {
+    const filters = parseCatalogQuery(
+      req.query,
+      categories.map((category) => category.id)
+    );
+    if (!filters.q) {
+      throw new ValidationError('q is required for product search.', 'q');
+    }
+    const result = queryCatalog(filters);
+
+    res.json({
+      meta: demoMeta({
+        total: result.total,
+        limit: filters.limit,
+        offset: filters.offset,
+      }),
+      query: filters.q,
+      products: result.products,
+    });
+  });
+
+  app.get('/api/products/:id', (req, res) => {
+    const productId = validateProductId(req.params.id);
+    const product = getProductById(productId);
+    if (!product) {
+      return sendError(res, 404, 'product_not_found', 'Product not found.');
+    }
+
+    return res.json({
+      meta: demoMeta(),
+      product: getProductWithCommunity(product),
+      reviews: getReviewsForProduct(product.id),
+      substitutes: getSubstitutes(product),
+    });
+  });
+
+  app.post(
+    ['/api/auth/register/start', '/api/register'],
+    requireJson,
+    async (req, res) => {
+      // Local development has a fixed OTP. Production must use a configured
+      // SMS provider and therefore fails before inspecting account data.
+      otpService.assertEnabled();
+      const registration = validateRegistrationStart(req.body);
+      const conflict = findRegistrationConflict(load(), registration);
+      if (conflict) throwRegistrationConflict(conflict);
+
+      const passwordHash = await hashPassword(registration.password);
+      const challenge = otpService.request(registration.phone, 'registration');
+      pendingRegistrationService.store(challenge, {
+        email: registration.email,
+        username: registration.username,
+        phone: registration.phone,
+        passwordHash,
+      });
+
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader(
+        'Retry-After',
+        String(Math.ceil(otpService.cooldownMs / 1000))
+      );
+      return res.status(202).json({
+        challengeId: challenge.challengeId,
+        maskedPhone: maskPhoneNumber(registration.phone),
+        expiresAt: new Date(challenge.expiresAt).toISOString(),
+        expiresInSeconds: Math.ceil(otpService.ttlMs / 1000),
+        resendAfterSeconds: Math.ceil(otpService.cooldownMs / 1000),
+        developmentCode: DEV_OTP_CODE,
+        developmentOnly: true,
+        message:
+          'No SMS was sent. Enter the fixed local-development code shown in this response to finish creating the account.',
+      });
+    }
+  );
+
+  app.post(
+    ['/api/auth/register/verify', '/api/register/verify'],
+    requireJson,
+    (req, res) => {
+      const { challengeId, code } = validateRegistrationVerification(req.body);
+      const { phone } = otpService.verify(
+        challengeId,
+        code,
+        'registration'
+      );
+      const registration = pendingRegistrationService.consume(
+        challengeId,
+        phone
+      );
+      const now = new Date().toISOString();
+
+      const user = update((data) => {
+        const conflict = findRegistrationConflict(data, registration);
+        if (conflict) throwRegistrationConflict(conflict);
+
+        const account = {
+          id: data.nextUserId++,
+          email: registration.email,
+          username: registration.username,
+          passwordHash: registration.passwordHash,
+          phone: registration.phone,
+          displayName: registration.username,
+          avatarUrl: null,
+          bio: '',
+          phoneVerified: true,
+          role: 'user',
+          accountStatus: 'active',
+          createdAt: now,
+          updatedAt: now,
+        };
+        data.users.push(account);
+        return account;
+      });
+
+      const token = createToken({ userId: user.id, phoneVerified: true });
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(201).json({
+        token,
+        tokenType: 'Bearer',
+        expiresInSeconds: 604800,
+        authMode: 'local-development-password',
+        user: publicUser(user),
+      });
+    }
+  );
+
+  app.post(
+    ['/api/auth/login', '/api/login'],
+    requireJson,
+    async (req, res) => {
+      const { identifier, password } = validateLogin(req.body);
+      const user = load().users.find(
+        (candidate) =>
+          (typeof candidate.email === 'string' &&
+            candidate.email.toLowerCase() === identifier) ||
+          (typeof candidate.username === 'string' &&
+            candidate.username.toLowerCase() === identifier)
+      );
+      // Email and username aliases for the same account share one throttle.
+      const rateLimitKey = user ? `user:${user.id}` : `identifier:${identifier}`;
+      loginAttemptLimiter.assertAllowed(rateLimitKey);
+      const validPassword = await verifyPassword(password, user?.passwordHash);
+
+      if (!user || !validPassword) {
+        loginAttemptLimiter.recordFailure(rateLimitKey);
+        throw new CredentialError(
+          'The username/email or password is incorrect.'
+        );
+      }
+      if (user.phoneVerified !== true) {
+        throw new CredentialError('Phone verification is required.', {
+          status: 403,
+          code: 'phone_verification_required',
+        });
+      }
+      if ((user.accountStatus || 'active') !== 'active') {
+        throw new CredentialError('This account is not active.', {
+          status: 403,
+          code: 'account_not_active',
+        });
+      }
+
+      loginAttemptLimiter.clear(rateLimitKey);
+      const token = createToken({ userId: user.id, phoneVerified: true });
+      res.setHeader('Cache-Control', 'no-store');
+      return res.json({
+        token,
+        tokenType: 'Bearer',
+        expiresInSeconds: 604800,
+        authMode: 'local-development-password',
+        user: publicUser(user),
+      });
+    }
+  );
+
+  app.post('/api/auth/otp/request', requireJson, (req, res) => {
+    const { phone } = validateOtpRequest(req.body);
+    const challenge = otpService.request(phone);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Retry-After', String(Math.ceil(otpService.cooldownMs / 1000)));
+
+    return res.status(202).json({
+      challengeId: challenge.challengeId,
+      maskedPhone: maskPhoneNumber(phone),
+      expiresAt: new Date(challenge.expiresAt).toISOString(),
+      expiresInSeconds: Math.ceil(otpService.ttlMs / 1000),
+      resendAfterSeconds: Math.ceil(otpService.cooldownMs / 1000),
+      developmentCode: DEV_OTP_CODE,
+      developmentOnly: true,
+      message:
+        'No SMS was sent. Enter the fixed local-development code shown in this response.',
+    });
+  });
+
+  app.post('/api/auth/otp/verify', requireJson, (req, res) => {
+    const { challengeId, code } = validateOtpVerification(req.body);
+    const { phone } = otpService.verify(challengeId, code, 'legacy-auth');
+    const now = new Date().toISOString();
+    let isNewUser = false;
+
+    const user = update((data) => {
+      let existing = data.users.find((candidate) => candidate.phone === phone);
+      if (existing?.passwordHash) {
+        throw new CredentialError(
+          'This account uses username/email and password sign-in.',
+          { status: 409, code: 'password_login_required' }
+        );
+      }
+      if (!existing) {
+        const id = data.nextUserId++;
+        existing = {
+          id,
+          email: null,
+          username: null,
+          phone,
+          displayName: `WorthIt? member ${id}`,
+          avatarUrl: null,
+          bio: '',
+          phoneVerified: true,
+          role: 'user',
+          accountStatus: 'active',
+          createdAt: now,
+          updatedAt: now,
+        };
+        data.users.push(existing);
+        isNewUser = true;
+      } else {
+        existing.phoneVerified = true;
+        existing.updatedAt = now;
+      }
+      return existing;
+    });
+
+    const token = createToken({ userId: user.id, phoneVerified: true });
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({
+      token,
+      tokenType: 'Bearer',
+      expiresInSeconds: 604800,
+      isNewUser,
+      authMode: 'local-development-otp',
+      user: publicUser(user),
+    });
+  });
+
+  app.get(
+    '/api/auth/session',
+    authenticate,
+    requireActiveLocalUser,
+    (req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        authMode: req.localUser.passwordHash
+          ? 'local-development-password'
+          : 'local-development-otp',
+        user: publicUser(req.localUser),
+      });
+    }
+  );
+
+  app.get(
+    ['/api/ownership', '/api/inventory'],
+    authenticate,
+    requireActiveLocalUser,
+    (req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
+      const items = getUserOwnedItems(req.userId).map((item) =>
+        enrichOwnedItem(item)
+      );
+
+      if (req.path === '/api/inventory') return res.json(items);
+      return res.json({ items, total: items.length });
+    }
+  );
+
+  app.post(
+    ['/api/ownership', '/api/inventory'],
+    requireJson,
+    authenticate,
+    requireActiveLocalUser,
+    (req, res) => {
+      const input = validateOwnershipCreate(req.body);
+      const product = getProductById(input.productId);
+      if (!product) {
+        return sendError(res, 404, 'product_not_found', 'Product not found.');
+      }
+
+      const now = new Date().toISOString();
+      const item = update((data) => {
+        const record = {
+          id: data.nextOwnedItemId++,
+          userId: req.userId,
+          ...input,
+          productName: product.name,
+          categoryId: product.categoryId,
+          expectedLifespanMonths:
+            input.expectedLifespanMonths ?? product.expectedLifespanMonths,
+          createdAt: now,
+          updatedAt: now,
+        };
+        data.ownedItems.push(record);
+        return record;
+      });
+
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(201).json({ item: enrichOwnedItem(item) });
+    }
+  );
+
+  app.patch(
+    ['/api/ownership/:id', '/api/inventory/:id'],
+    requireJson,
+    authenticate,
+    requireActiveLocalUser,
+    (req, res) => {
+      const id = parsePositiveIntegerId(req.params.id);
+      const data = load();
+      const existing = data.ownedItems.find(
+        (item) => item.id === id && String(item.userId) === String(req.userId)
+      );
+      if (!existing) {
+        return sendError(
+          res,
+          404,
+          'owned_item_not_found',
+          'Owned item not found.'
+        );
+      }
+      const patch = validateOwnershipPatch(req.body, existing);
+
+      const updatedItem = update((latestData) => {
+        const item = latestData.ownedItems.find(
+          (candidate) =>
+            candidate.id === id &&
+            String(candidate.userId) === String(req.userId)
+        );
+        if (!item) return null;
+        Object.assign(item, patch, { updatedAt: new Date().toISOString() });
+        return item;
+      });
+      if (!updatedItem) {
+        return sendError(
+          res,
+          409,
+          'owned_item_changed',
+          'The owned item changed before it could be updated.'
+        );
+      }
+
+      res.setHeader('Cache-Control', 'no-store');
+      return res.json({ item: enrichOwnedItem(updatedItem) });
+    }
+  );
+
+  app.delete(
+    ['/api/ownership/:id', '/api/inventory/:id'],
+    authenticate,
+    requireActiveLocalUser,
+    (req, res) => {
+      const id = parsePositiveIntegerId(req.params.id);
+      let removed = false;
+
+      update((data) => {
+        const index = data.ownedItems.findIndex(
+          (item) =>
+            item.id === id && String(item.userId) === String(req.userId)
+        );
+        if (index !== -1) {
+          data.ownedItems.splice(index, 1);
+          removed = true;
+        }
+      });
+      if (!removed) {
+        return sendError(
+          res,
+          404,
+          'owned_item_not_found',
+          'Owned item not found.'
+        );
+      }
+      return res.status(204).send();
+    }
+  );
+
+  app.get(
+    '/api/products/:id/purchase-score',
+    authenticate,
+    requireActiveLocalUser,
+    (req, res) => {
+      const productId = validateProductId(req.params.id);
+      const product = getProductById(productId);
+      if (!product) {
+        return sendError(res, 404, 'product_not_found', 'Product not found.');
+      }
+
+      const community = getCommunitySummary(product.id);
+      const ownedItems = getUserOwnedItems(req.userId);
+      const result = calculatePersonalPurchaseScore({
+        product,
+        communityRating: community.averageRating,
+        reviewCount: community.reviewCount,
+        ownedItems,
+      });
+      const shouldKeepExisting = result.factors.some((factor) =>
+        [
+          'active-alternative-over-half-remaining',
+          'alternative-20-to-50-percent-remaining',
+        ].includes(factor.code)
+      );
+
+      res.setHeader('Cache-Control', 'no-store');
+      return res.json({
+        meta: demoMeta({
+          scoreUsesPrivateLocalOwnershipData: true,
+          productionReady: false,
+        }),
+        product: {
+          id: product.id,
+          name: product.name,
+          categoryId: product.categoryId,
+        },
+        community,
+        purchaseScore: result,
+        recommendation: shouldKeepExisting
+          ? {
+              type: 'keep-what-you-have',
+              label: 'Keep what you already have',
+            }
+          : null,
+      });
+    }
+  );
+
+  app.use((req, res) =>
+    sendError(res, 404, 'route_not_found', 'API route not found.')
+  );
+
+  app.use((error, req, res, next) => {
+    if (res.headersSent) return next(error);
+    if (error instanceof ValidationError) {
+      return sendError(res, error.status, error.code, error.message, {
+        field: error.field,
+      });
+    }
+    if (error instanceof OtpError) {
+      if (error.details?.retryAfterSeconds) {
+        res.setHeader('Retry-After', String(error.details.retryAfterSeconds));
+      }
+      return sendError(
+        res,
+        error.status,
+        error.code,
+        error.message,
+        error.details
+      );
+    }
+    if (error instanceof CredentialError) {
+      if (error.details?.retryAfterSeconds) {
+        res.setHeader('Retry-After', String(error.details.retryAfterSeconds));
+      }
+      return sendError(
+        res,
+        error.status,
+        error.code,
+        error.message,
+        error.details
+      );
+    }
+    if (error instanceof DatabaseError) {
+      console.error(error.message);
+      return sendError(
+        res,
+        error.status,
+        error.code,
+        'The local-development data store is unavailable.'
+      );
+    }
+    if (error?.type === 'entity.parse.failed') {
+      return sendError(
+        res,
+        400,
+        'invalid_json',
+        'Request body contains invalid JSON.'
+      );
+    }
+    if (error?.type === 'entity.too.large') {
+      return sendError(
+        res,
+        413,
+        'request_too_large',
+        'Request body must be 32 KB or smaller.'
+      );
+    }
+
+    console.error(error);
+    return sendError(
+      res,
+      500,
+      'internal_error',
+      'An unexpected server error occurred.'
+    );
+  });
+
+  return app;
+}
+
+function parsePort(value) {
+  const port = Number(value ?? DEFAULT_PORT);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('PORT must be a whole number between 1 and 65535.');
   }
-});
+  return port;
+}
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
+function start(portValue = process.env.PORT) {
+  const port = parsePort(portValue);
+  const server = app.listen(port, () => {
+    console.log(`WorthIt? local-development API listening on port ${port}`);
+  });
 
-process.on('SIGTERM', async () => {
-  if (browserInstance) await browserInstance.close();
-  process.exit(0);
-});
+  const shutdown = () => {
+    server.close((error) => {
+      if (error) {
+        console.error(error);
+        process.exitCode = 1;
+      }
+    });
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
+  return server;
+}
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+const app = createApp();
+
+if (require.main === module) start();
+
+module.exports = {
+  app,
+  createApp,
+  queryCatalog,
+  start,
+};

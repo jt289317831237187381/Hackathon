@@ -1,19 +1,21 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Local-development API with credential and phone-verified signup for the WorthIt? demo",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "check": "node --check server.js && node --check auth.js && node --check db.js && node --check demo-fixtures.js && node --check scoring.js && node --check validation.js",
+    "test": "node --test test/*.test.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "bcrypt": "^6.0.0",
-    "express": "^5.2.1",
-    "puppeteer": "^25.3.0"
+    "express": "^5.2.1"
   }
 }
