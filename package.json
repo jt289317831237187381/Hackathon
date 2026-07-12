@@ -1,0 +1,11 @@
+{
+  "name": "hackathon",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "concurrently \"npm start --prefix backend\" \"npm start --prefix frontend\""
+  },
+  "dependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
