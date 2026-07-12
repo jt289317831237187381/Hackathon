@@ -17,7 +17,7 @@ import {
 } from './utils/purchaseScoring';
 import './App.css';
 
-const TODAY = '2026-07-11';
+const TODAY = '2026-07-12';
 const STORAGE = {
   session: 'worthit.session.v1',
   saved: 'worthit.saved.v1',
@@ -46,10 +46,22 @@ function formatDate(value) {
 }
 
 function monthsToWords(months) {
-  if (months < 12) return `${months} month${months === 1 ? '' : 's'}`;
-  const years = Math.floor(months / 12);
-  const remainder = months % 12;
+  const numericMonths = Number(months);
+  if (!Number.isFinite(numericMonths) || numericMonths <= 0) return 'Not enough data';
+  if (numericMonths < 12) return `${numericMonths} month${numericMonths === 1 ? '' : 's'}`;
+  const years = Math.floor(numericMonths / 12);
+  const remainder = numericMonths % 12;
   return `${years} year${years === 1 ? '' : 's'}${remainder ? ` ${remainder} mo` : ''}`;
+}
+
+function numericOrFallback(value, fallback = Number.NEGATIVE_INFINITY) {
+  const numericValue = Number(value);
+  return value !== null && value !== '' && Number.isFinite(numericValue) ? numericValue : fallback;
+}
+
+function hasCommunityRating(product) {
+  const rating = Number(product.rating);
+  return product.reviewCount > 0 && Number.isFinite(rating) && rating >= 1 && rating <= 5;
 }
 
 function classNames(...values) {
@@ -66,10 +78,12 @@ function localPasswordHash(value) {
 }
 
 function RatingStars({ rating, size = 'normal' }) {
+  const numericRating = Number(rating);
+  const hasRating = rating !== null && rating !== '' && Number.isFinite(numericRating) && numericRating >= 1;
   return (
-    <span className={`stars stars-${size}`} aria-label={`${rating} out of 5 stars`}>
+    <span className={`stars stars-${size}`} aria-label={hasRating ? `${numericRating} out of 5 stars` : 'No community rating yet'}>
       {[1, 2, 3, 4, 5].map((star) => (
-        <span key={star} className={star <= Math.round(rating) ? 'star-on' : 'star-off'}>★</span>
+        <span key={star} className={hasRating && star <= Math.round(numericRating) ? 'star-on' : 'star-off'}>★</span>
       ))}
     </span>
   );
@@ -89,7 +103,7 @@ function DemoBanner() {
     <div className="demo-banner" role="note">
       <div className="site-width demo-banner-inner">
         <span className="demo-dot" />
-        <span><strong>Demo workspace</strong> · Reviews and activity shown here are labelled fictional fixtures, not real community claims.</span>
+        <span><strong>Demo workspace</strong> · Official product facts are source-backed; synthetic reviews are visibly labelled and excluded from community evidence.</span>
         <button onClick={() => window.location.hash = '/guidelines'}>How trust works <Icon name="arrow" size={14} /></button>
       </div>
     </div>
@@ -144,11 +158,32 @@ function Header({ route, navigate, session, onSignIn, onSignOut, onContribute, m
 }
 
 function ProductVisual({ product, size = 'card' }) {
+  const [imageFailed, setImageFailed] = useState(false);
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [product.id, product.imageUrl]);
+
+  const showOfficialImage = Boolean(product.imageUrl) && !imageFailed;
+
   return (
-    <div className={`product-visual product-visual-${size} palette-${product.palette}`} aria-hidden="true">
-      <span className="visual-orbit" />
-      <span className="product-glyph">{product.glyph}</span>
-      <span className="visual-label">{product.categoryLabel}</span>
+    <div className={classNames(`product-visual product-visual-${size} palette-${product.palette}`, showOfficialImage && 'has-product-image')}>
+      {showOfficialImage ? (
+        <img
+          className="product-image"
+          src={product.imageUrl}
+          alt={product.imageAlt || `${product.name} official product image`}
+          loading={size === 'detail' ? 'eager' : 'lazy'}
+          decoding="async"
+          onError={() => setImageFailed(true)}
+        />
+      ) : (
+        <>
+          <span className="visual-orbit" aria-hidden="true" />
+          <span className="product-glyph" aria-hidden="true">{product.glyph}</span>
+        </>
+      )}
+      <span className="visual-label" aria-hidden="true">{showOfficialImage ? 'Official image' : product.categoryLabel}</span>
     </div>
   );
 }
@@ -190,13 +225,11 @@ function ProductCard({ product, navigate, saved, onSave, variant = 'standard', s
         <h3>{product.name}</h3>
         <p className="product-brand">{product.brand} · {product.model}</p>
         <div className="card-rating-line">
-          <strong>{product.rating.toFixed(1)}</strong>
-          <RatingStars rating={product.rating} size="small" />
-          <span>{product.reviewCount} reviews</span>
+          {hasCommunityRating(product) ? <><strong>{Number(product.rating).toFixed(1)}</strong><RatingStars rating={product.rating} size="small" /><span>{product.reviewCount} community reviews</span></> : <><strong>—</strong><RatingStars rating={null} size="small" /><span>Awaiting community reviews</span></>}
         </div>
         <div className="card-facts">
           <span><Icon name="clock" size={15} />{monthsToWords(product.lifespanMonths)} expected</span>
-          <span><Icon name="user" size={15} />{product.owners} current owners</span>
+          <span><Icon name="user" size={15} />{product.owners || 0} current owners</span>
         </div>
         {score && (
           <div className={`personal-preview score-${score.score < 50 ? 'skip' : score.score < 75 ? 'consider' : 'go'}`}>
@@ -243,18 +276,18 @@ function ProductFeedItem({ product, navigate, saved, onSave, session, ownedItems
       <div className="feed-rank"><span>{String(rank).padStart(2, '0')}</span><small>hot</small></div>
       <button className="feed-visual-button" onClick={() => navigate(`/product/${product.id}`)} aria-label={`Open ${product.name}`}><ProductVisual product={product} size="feed" /></button>
       <div className="feed-item-body">
-        <div className="feed-meta"><span>{product.categoryLabel}</span><span>·</span><span>{product.brand}</span>{product.trendingRank <= 3 && <em>Trending</em>}</div>
+        <div className="feed-meta"><span>{product.categoryLabel}</span><span>·</span><span>{product.brand}</span><em>Synthetic prompt</em></div>
         <button className="feed-title" onClick={() => navigate(`/product/${product.id}`)}>{product.name}</button>
         <p>{product.discussion || product.summary}</p>
         <div className="feed-evidence">
-          <span className="feed-rating"><strong>{product.rating.toFixed(1)}</strong><RatingStars rating={product.rating} size="small" /></span>
-          <span>{product.reviewCount} reviews</span>
+          <span className="feed-rating"><strong>{hasCommunityRating(product) ? Number(product.rating).toFixed(1) : '—'}</strong><RatingStars rating={hasCommunityRating(product) ? product.rating : null} size="small" /></span>
+          <span>{product.reviewCount || 0} community reviews</span>
           <span><Icon name="clock" size={14} />{monthsToWords(product.lifespanMonths)} expected</span>
           {score && <span className={classNames('feed-score', score.score < 50 && 'skip')}>{score.score}/100 · {score.recommendationLabel}</span>}
         </div>
         <div className="feed-actions">
           <button onClick={() => navigate(`/product/${product.id}`)}><Icon name="message" size={15} />{latestReview?.comments || 0} discussions</button>
-          <button onClick={() => navigate(`/product/${product.id}`)}><Icon name="user" size={15} />{product.owners} owners</button>
+          <button onClick={() => navigate(`/product/${product.id}`)}><Icon name="user" size={15} />{product.owners || 0} owners</button>
           <button className={saved ? 'active' : ''} onClick={() => onSave(product.id)}><Icon name="bookmark" size={15} fill={saved ? 'currentColor' : 'none'} />{saved ? 'Saved' : 'Save'}</button>
         </div>
       </div>
@@ -263,21 +296,22 @@ function ProductFeedItem({ product, navigate, saved, onSave, session, ownedItems
 }
 
 function ScoreSystemExplainer({ navigate }) {
+  const exampleProduct = initialProducts[0];
   return (
     <aside className="simple-score-explainer">
       <div className="eyebrow light">Two separate answers</div>
       <h2>A good product can still be the wrong purchase.</h2>
       <div className="simple-score-row community">
-        <span><small>Community rating</small><strong>4.3<em>/5</em></strong></span>
-        <span><b>Is it good?</b><small>From 127 platform reviews</small></span>
+        <span><small>Community rating</small><strong>—</strong></span>
+        <span><b>Is it good?</b><small>No verified community reviews yet</small></span>
       </div>
       <div className="score-not-equal">≠</div>
       <div className="simple-score-row personal">
-        <span><small>Personal score</small><strong>39<em>/100</em></strong></span>
-        <span><b>Is it right for you?</b><small>You own a similar active item</small></span>
+        <span><small>Personal score</small><strong>?<em>/100</em></strong></span>
+        <span><b>Is it right for you?</b><small>Calculated from your private ownership record</small></span>
       </div>
       <p>Community quality and personal need are never blended into one unexplained rating.</p>
-      <button onClick={() => navigate('/product/auraflow-nc1')}>See the score explained <Icon name="arrow" size={14} /></button>
+      <button onClick={() => navigate(`/product/${exampleProduct.id}`)}>See the score explained <Icon name="arrow" size={14} /></button>
     </aside>
   );
 }
@@ -290,8 +324,8 @@ function HomePage({ navigate, products, savedIds, onSave, session, ownedItems })
     navigate(`/discover${search.trim() ? `?q=${encodeURIComponent(search.trim())}` : ''}`);
   };
   const feedProducts = useMemo(() => [...products].sort((a, b) => {
-    if (tab === 'recent') return b.releaseYear - a.releaseYear || a.trendingRank - b.trendingRank;
-    if (tab === 'lasting') return b.lifespanMonths - a.lifespanMonths;
+    if (tab === 'recent') return numericOrFallback(b.releaseYear) - numericOrFallback(a.releaseYear) || a.trendingRank - b.trendingRank;
+    if (tab === 'lasting') return numericOrFallback(b.lifespanMonths) - numericOrFallback(a.lifespanMonths);
     return a.trendingRank - b.trendingRank;
   }).slice(0, 9), [products, tab]);
 
@@ -300,7 +334,7 @@ function HomePage({ navigate, products, savedIds, onSave, session, ownedItems })
       <div className="site-width feed-layout">
         <section className="feed-main">
           <div className="feed-intro">
-            <div><h1>What people are weighing up</h1><p>First-party product experiences, repair stories and honest “keep what you have” advice.</p></div>
+            <div><h1>What people are weighing up</h1><p>Official product facts and clearly labelled synthetic prompts, ready for first-party community evidence.</p></div>
             <button className="button button-ink" onClick={() => navigate('/contribute')}><Icon name="edit" size={15} />Post</button>
           </div>
           <form className="feed-search" onSubmit={submitSearch}>
@@ -358,13 +392,15 @@ function DiscoverPage({ route, navigate, products, savedIds, onSave, session, ow
     const search = query.trim().toLowerCase();
     const result = products.filter((product) => {
       const matchesSearch = !search || [product.name, product.brand, product.model, product.categoryLabel].join(' ').toLowerCase().includes(search);
-      return matchesSearch && (category === 'all' || product.category === category) && product.rating >= Number(minRating) && product.lifespanMonths >= Number(lifespan);
+      const matchesRating = minRating === '0' || (hasCommunityRating(product) && Number(product.rating) >= Number(minRating));
+      const matchesLifespan = lifespan === '0' || numericOrFallback(product.lifespanMonths) >= Number(lifespan);
+      return matchesSearch && (category === 'all' || product.category === category) && matchesRating && matchesLifespan;
     });
     return result.sort((a, b) => {
-      if (sort === 'rating') return b.rating - a.rating || b.reviewCount - a.reviewCount;
+      if (sort === 'rating') return numericOrFallback(b.rating) - numericOrFallback(a.rating) || b.reviewCount - a.reviewCount;
       if (sort === 'reviews') return b.reviewCount - a.reviewCount;
-      if (sort === 'lifespan') return b.lifespanMonths - a.lifespanMonths;
-      if (sort === 'recent') return b.releaseYear - a.releaseYear;
+      if (sort === 'lifespan') return numericOrFallback(b.lifespanMonths) - numericOrFallback(a.lifespanMonths);
+      if (sort === 'recent') return numericOrFallback(b.releaseYear) - numericOrFallback(a.releaseYear);
       return a.trendingRank - b.trendingRank;
     });
   }, [products, query, category, minRating, lifespan, sort]);
@@ -403,13 +439,13 @@ function DiscoverPage({ route, navigate, products, savedIds, onSave, session, ow
 
 function CommunityPage({ navigate, products, onContribute }) {
   const [tab, setTab] = useState('popular');
-  const discussions = useMemo(() => [...products].sort((a, b) => tab === 'recent' ? b.releaseYear - a.releaseYear : a.trendingRank - b.trendingRank).slice(0, 12), [products, tab]);
+  const discussions = useMemo(() => [...products].sort((a, b) => tab === 'recent' ? numericOrFallback(b.releaseYear) - numericOrFallback(a.releaseYear) : a.trendingRank - b.trendingRank).slice(0, 12), [products, tab]);
   return (
     <main className="page-shell community-page-simple">
       <div className="site-width simple-page-shell community-layout-simple">
         <section className="community-main-simple">
           <header className="simple-page-head community-head-simple">
-            <div><div className="eyebrow accent">WorthIt? community</div><h1>Real questions. Lived experience.</h1><p>Discussions and reviews started by people on this platform.</p></div>
+            <div><div className="eyebrow accent">WorthIt? community</div><h1>Product questions, clearly sourced.</h1><p>Synthetic prompts preview the format without being counted as community activity.</p></div>
             <button className="button button-ink" onClick={onContribute}><Icon name="edit" size={15} />Start a post</button>
           </header>
           <div className="community-toolbar-simple">
@@ -421,12 +457,12 @@ function CommunityPage({ navigate, products, onContribute }) {
               const review = (reviewsByProduct[product.id] || [])[0];
               return (
                 <article className="community-thread" key={product.id}>
-                  <div className="thread-signal"><Icon name="message" size={17} /><strong>{review?.comments || product.trendingRank + 2}</strong><small>replies</small></div>
+                  <div className="thread-signal"><Icon name="message" size={17} /><strong>0</strong><small>replies</small></div>
                   <div className="thread-body">
-                    <div className="feed-meta"><span>{product.categoryLabel}</span><span>·</span><span>{product.name}</span><em>Demo discussion</em></div>
+                    <div className="feed-meta"><span>{product.categoryLabel}</span><span>·</span><span>{product.name}</span><em>Synthetic demo prompt</em></div>
                     <button className="thread-title" onClick={() => navigate(`/product/${product.id}`)}>{product.discussion}</button>
                     <p>{review?.text || product.summary}</p>
-                    <div className="thread-footer"><span><RatingStars rating={product.rating} size="small" /> {product.rating} community rating</span><span>{product.reviewCount} reviews</span><span>Active today</span></div>
+                    <div className="thread-footer"><span><RatingStars rating={hasCommunityRating(product) ? product.rating : null} size="small" /> {hasCommunityRating(product) ? `${Number(product.rating).toFixed(1)} community rating` : 'No community rating'}</span><span>{product.reviewCount || 0} community reviews</span><span>Synthetic preview</span></div>
                   </div>
                   <button className="thread-open" onClick={() => navigate(`/product/${product.id}`)} aria-label={`Open discussion about ${product.name}`}><Icon name="chevron" size={18} /></button>
                 </article>
@@ -444,11 +480,12 @@ function CommunityPage({ navigate, products, onContribute }) {
 }
 
 function RatingDistribution({ product }) {
-  const max = Math.max(...product.distribution);
+  const distribution = Array.isArray(product.distribution) ? product.distribution : [0, 0, 0, 0, 0];
+  const max = Math.max(1, ...distribution);
   return (
     <div className="rating-distribution">
       {[5, 4, 3, 2, 1].map((star, index) => {
-        const value = product.distribution[4 - index];
+        const value = distribution[4 - index] || 0;
         return <div key={star}><span>{star}</span><span className="tiny-star">★</span><i><b style={{ width: `${(value / max) * 100}%` }} /></i><em>{value}</em></div>;
       })}
     </div>
@@ -488,6 +525,7 @@ function PersonalScoreCard({ product, session, ownedItems, onSignIn }) {
 function ReviewCard({ review, helpful, onHelpful, onComment, onReport }) {
   const [commenting, setCommenting] = useState(false);
   const [comment, setComment] = useState('');
+  const isSynthetic = review.isSynthetic || review.provenance === 'synthetic_demo';
   const submitComment = (event) => {
     event.preventDefault();
     if (!comment.trim()) return;
@@ -496,28 +534,28 @@ function ReviewCard({ review, helpful, onHelpful, onComment, onReport }) {
     setCommenting(false);
   };
   return (
-    <article className="review-card">
+    <article className={classNames('review-card', isSynthetic && 'synthetic-review-card')}>
       <div className="reviewer-column">
         <span className="avatar review-avatar">{review.initials}</span>
         <strong>{review.user}</strong>
-        <small>Platform member</small>
+        <small>{isSynthetic ? 'Synthetic demo profile' : 'Platform member'}</small>
       </div>
       <div className="review-main">
         <div className="review-topline">
           <div><RatingStars rating={review.rating} /><span className="review-date">{formatDate(review.date)}</span></div>
-          {review.demo && <span className="fixture-chip">Demonstration review</span>}
+          {isSynthetic && <span className="fixture-chip">Synthetic demo review</span>}
         </div>
-        <span className="relationship-pill"><Icon name="box" size={14} />{review.relationship}{review.ownershipMonths > 1 && ` · ${monthsToWords(review.ownershipMonths)}`}</span>
+        <span className="relationship-pill"><Icon name="box" size={14} />{isSynthetic ? 'Synthetic scenario: ' : ''}{review.relationship}{review.ownershipMonths > 1 && ` · ${monthsToWords(review.ownershipMonths)}`}</span>
         <h3>{review.title}</h3>
         {review.text && <p>{review.text}</p>}
         {(review.pros?.length || review.cons?.length) && <div className="pros-cons"><div><strong>Worked well</strong>{review.pros.map((item) => <span key={item}><Icon name="check" size={13} />{item}</span>)}</div><div><strong>Worth knowing</strong>{review.cons.map((item) => <span key={item}><i>−</i>{item}</span>)}</div></div>}
-        <div className="review-buy-again"><span className={review.wouldBuyAgain ? 'yes' : 'no'}><Icon name={review.wouldBuyAgain ? 'check' : 'close'} size={13} /></span>{review.wouldBuyAgain ? 'Would buy it again' : 'Would not buy it again'}<small>No commercial relationship disclosed</small></div>
+        <div className="review-buy-again"><span className={review.wouldBuyAgain ? 'yes' : 'no'}><Icon name={review.wouldBuyAgain ? 'check' : 'close'} size={13} /></span>{review.wouldBuyAgain ? 'Would buy it again' : 'Would not buy it again'}<small>{isSynthetic ? 'Scenario only · not an ownership claim' : 'No commercial relationship disclosed'}</small></div>
         <div className="review-actions">
-          <button className={helpful ? 'active' : ''} onClick={() => onHelpful(review.id)}><Icon name="thumb" size={16} /> Helpful · {review.helpful + (helpful ? 1 : 0)}</button>
-          <button onClick={() => setCommenting(!commenting)}><Icon name="message" size={16} /> Discuss · {review.comments}</button>
-          <button className="report-action" onClick={() => onReport(review.id)}><Icon name="flag" size={15} /> Report</button>
+          <button disabled={isSynthetic} title={isSynthetic ? 'Interactions are disabled for synthetic demo reviews' : undefined} className={helpful ? 'active' : ''} onClick={() => onHelpful(review.id)}><Icon name="thumb" size={16} /> Helpful · {review.helpful + (helpful ? 1 : 0)}</button>
+          <button disabled={isSynthetic} title={isSynthetic ? 'Interactions are disabled for synthetic demo reviews' : undefined} onClick={() => setCommenting(!commenting)}><Icon name="message" size={16} /> Discuss · {review.comments}</button>
+          <button disabled={isSynthetic} title={isSynthetic ? 'Interactions are disabled for synthetic demo reviews' : undefined} className="report-action" onClick={() => onReport(review.id)}><Icon name="flag" size={15} /> Report</button>
         </div>
-        {commenting && <form className="comment-form" onSubmit={submitComment}><label className="sr-only" htmlFor={`comment-${review.id}`}>Add a comment</label><input id={`comment-${review.id}`} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Add a respectful question or comment…" autoFocus /><button className="button button-ink" type="submit">Post</button></form>}
+        {!isSynthetic && commenting && <form className="comment-form" onSubmit={submitComment}><label className="sr-only" htmlFor={`comment-${review.id}`}>Add a comment</label><input id={`comment-${review.id}`} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Add a respectful question or comment…" autoFocus /><button className="button button-ink" type="submit">Post</button></form>}
       </div>
     </article>
   );
@@ -531,7 +569,9 @@ function ProductPage({ product, navigate, savedIds, onSave, session, ownedItems,
   const reviews = [...(userReview ? [userReview] : []), ...demoReviews]
     .filter((review) => !writtenOnly || review.text)
     .sort((a, b) => sort === 'recent' ? new Date(b.date) - new Date(a.date) : sort === 'highest' ? b.rating - a.rating : sort === 'lowest' ? a.rating - b.rating : b.helpful - a.helpful);
-  const substitutes = initialProducts.filter((item) => item.category === product.category && item.id !== product.id).sort((a, b) => b.rating - a.rating).slice(0, 2);
+  const substitutes = initialProducts.filter((item) => item.category === product.category && item.id !== product.id).sort((a, b) => numericOrFallback(b.rating) - numericOrFallback(a.rating)).slice(0, 2);
+  const communityRatingAvailable = hasCommunityRating(product);
+  const repairabilityAvailable = product.repairability !== null && Number.isFinite(Number(product.repairability));
 
   return (
     <main className="page-shell product-page">
@@ -540,21 +580,21 @@ function ProductPage({ product, navigate, savedIds, onSave, session, ownedItems,
         <section className="product-identity-grid">
           <ProductVisual product={product} size="detail" />
           <div className="product-identity">
-            <div className="product-meta-line"><span>{product.categoryLabel}</span><span>•</span><span>Released {product.releaseYear}</span></div>
+            <div className="product-meta-line"><span>{product.categoryLabel}</span><span>•</span><span>{product.releaseYear ? `Released ${product.releaseYear}` : 'Release date not stated'}</span></div>
             <h1>{product.name}</h1>
             <p className="product-byline">{product.brand} · Model {product.model}</p>
             <p className="product-summary">{product.summary}</p>
-            <div className="validation-line"><span className="validation-badge"><Icon name="shield" size={15} />{product.validation}</span><span>Submitted by <strong>community member Lena T.</strong></span></div>
+            <div className="validation-line"><span className="validation-badge"><Icon name="shield" size={15} />Official specifications</span><span>Product facts checked against manufacturer sources</span></div>
             <div className="identity-actions">
               <SaveButton productId={product.id} saved={savedIds.includes(product.id)} onToggle={onSave} />
               <button className="button button-outline" onClick={() => requireAuth(() => onOpenOwned(product))}><Icon name="plus" size={16} /> I own this</button>
-              <a className="external-product-link" href={product.officialUrl} target="_blank" rel="noreferrer">Official product page <Icon name="external" size={15} /></a>
+              {product.officialUrl && <a className="external-product-link" href={product.officialUrl} target="_blank" rel="noreferrer">Official product page <Icon name="external" size={15} /></a>}
             </div>
           </div>
           <div className="identity-facts">
-            <div><span>Typical price</span><strong>{formatPrice(product)}</strong><small>Community-entered guide</small></div>
-            <div><span>Expected lifespan</span><strong>{monthsToWords(product.lifespanMonths)}</strong><small>Source: owner consensus</small></div>
-            <div><span>Repairability</span><strong>{product.repairability.toFixed(1)} <small>/ 5</small></strong><small>From platform reviews</small></div>
+            <div><span>Official listed price</span><strong>{formatPrice(product)}</strong><small>{product.priceNote || (product.price === null ? 'Manufacturer does not list a direct price' : 'Manufacturer website price snapshot')}</small></div>
+            <div><span>Expected lifespan</span><strong>{monthsToWords(product.lifespanMonths)}</strong><small>No estimate without owner evidence</small></div>
+            <div><span>Community repairability</span><strong>{repairabilityAvailable ? <>{Number(product.repairability).toFixed(1)} <small>/ 5</small></> : 'Not rated'}</strong><small>Synthetic reviews are excluded</small></div>
           </div>
         </section>
 
@@ -562,30 +602,31 @@ function ProductPage({ product, navigate, savedIds, onSave, session, ownedItems,
           <div className="community-rating-card">
             <div className="card-section-title"><div><div className="eyebrow">Question one</div><h2>Is it considered good?</h2></div><ConfidencePill count={product.reviewCount} /></div>
             <div className="community-rating-body">
-              <div className="big-rating"><strong>{product.rating.toFixed(1)}</strong><span><RatingStars rating={product.rating} /><small>from {product.reviewCount} community reviews</small></span></div>
+              <div className="big-rating"><strong>{communityRatingAvailable ? Number(product.rating).toFixed(1) : '—'}</strong><span><RatingStars rating={communityRatingAvailable ? product.rating : null} /><small>{communityRatingAvailable ? `from ${product.reviewCount} community ${product.reviewCount === 1 ? 'review' : 'reviews'}` : 'No community reviews yet'}</small></span></div>
               <RatingDistribution product={product} />
             </div>
-            <div className="owner-signal-grid"><div><strong>{product.owners}</strong><span>current owners</span></div><div><strong>{product.longTermOwners}</strong><span>long-term owners</span></div><div><strong>{product.buyAgain}%</strong><span>would buy again</span></div></div>
+            {!communityRatingAvailable && <p className="community-empty-note">The synthetic examples below are interface fixtures. They do not affect this rating, distribution, or any owner signal.</p>}
+            <div className="owner-signal-grid"><div><strong>{product.owners || 0}</strong><span>current owners</span></div><div><strong>{product.longTermOwners || 0}</strong><span>long-term owners</span></div><div><strong>{product.buyAgain === null ? '—' : `${product.buyAgain}%`}</strong><span>would buy again</span></div></div>
           </div>
           <PersonalScoreCard product={product} session={session} ownedItems={ownedItems} onSignIn={() => requireAuth()} />
         </section>
 
         <section className="reviews-layout">
           <div className="reviews-content">
-            <div className="reviews-title-row"><div><div className="eyebrow accent">First-party experiences</div><h2>What owners are saying</h2><p>Relationship and length of use stay visible so you can weigh each perspective.</p></div><button className="button button-clay" onClick={() => requireAuth(() => onOpenReview(product))}><Icon name="edit" size={16} />{userReview ? 'Edit your review' : 'Share your experience'}</button></div>
+            <div className="reviews-title-row"><div><div className="eyebrow accent">Community reviews + labelled fixtures</div><h2>Experiences, with provenance</h2><p>User-submitted local reviews stay distinct from synthetic examples and are the only reviews counted above.</p></div><button className="button button-clay" onClick={() => requireAuth(() => onOpenReview(product))}><Icon name="edit" size={16} />{userReview ? 'Edit your review' : 'Share your experience'}</button></div>
             <div className="review-controls">
               <FilterSelect label="Sort by" value={sort} onChange={(e) => setSort(e.target.value)}><option value="helpful">Most helpful</option><option value="recent">Most recent</option><option value="highest">Highest rating</option><option value="lowest">Lowest rating</option></FilterSelect>
               <label className="check-filter"><input type="checkbox" checked={writtenOnly} onChange={(e) => setWrittenOnly(e.target.checked)} /><i><Icon name="check" size={12} /></i> Written reviews only</label>
               <button className="more-filters"><Icon name="sliders" size={15} /> More filters</button>
             </div>
-            <div className="fixture-notice"><Icon name="info" size={16} /><span><strong>Development fixture content</strong> — these sample reviews demonstrate the experience and are not presented as real community testimony.</span></div>
+            <div className="fixture-notice"><Icon name="info" size={16} /><span><strong>8 synthetic demo reviews follow</strong> — every fixture is labelled, has zero engagement, cannot be interacted with, and is excluded from all community metrics.</span></div>
             <div className="review-stack">
               {reviews.map((review) => <ReviewCard key={review.id} review={review} helpful={helpfulIds.includes(review.id)} onHelpful={(id) => requireAuth(() => onHelpful(id))} onComment={(id, comment) => requireAuth(() => onComment(id, comment))} onReport={(id) => requireAuth(() => onReport(id))} />)}
             </div>
           </div>
           <aside className="review-sidebar">
-            <div className="sidebar-card longevity-card"><span className="sidebar-icon"><Icon name="clock" size={22} /></span><div className="eyebrow">Ownership & longevity</div><h3>What happens after year one?</h3><div className="longevity-stat"><strong>{product.longTermOwners}</strong><span>reviewers have used it for 2+ years</span></div><div className="meter"><i style={{ width: `${Math.min(100, product.longTermOwners / Math.max(1, product.owners) * 100)}%` }} /></div><p>Long-term owners most often mention replaceable wear parts and battery health.</p></div>
-            <div className="sidebar-card trust-card"><Icon name="shield" size={22} /><h3>Human reviews only</h3><p>WorthIt? doesn’t scrape or blend in ratings from elsewhere. Reviews require a phone-verified account.</p><button onClick={() => navigate('/guidelines')}>Read the community rules <Icon name="arrow" size={14} /></button></div>
+            <div className="sidebar-card longevity-card"><span className="sidebar-icon"><Icon name="clock" size={22} /></span><div className="eyebrow">Ownership & longevity</div><h3>Evidence still needed</h3><div className="longevity-stat"><strong>{product.longTermOwners || 0}</strong><span>community reviewers at 2+ years</span></div><div className="meter"><i style={{ width: `${Math.min(100, (product.longTermOwners || 0) / Math.max(1, product.owners || 0) * 100)}%` }} /></div><p>No long-term conclusion is inferred from synthetic examples.</p></div>
+            <div className="sidebar-card trust-card"><Icon name="shield" size={22} /><h3>Provenance stays visible</h3><p>Official specifications, local community reviews, and synthetic interface fixtures are identified separately.</p><button onClick={() => navigate('/guidelines')}>Read the community rules <Icon name="arrow" size={14} /></button></div>
           </aside>
         </section>
 
@@ -593,13 +634,13 @@ function ProductPage({ product, navigate, savedIds, onSave, session, ownedItems,
           <SectionHeading eyebrow="Before replacing anything" title="A few honest alternatives" description="Including the option most shopping sites leave out." />
           <div className="substitute-grid">
             <article className="keep-card"><div className="keep-visual"><Icon name="leaf" size={31} /></div><div><span className="best-choice-chip">Lowest-impact option</span><h3>Keep what you already have</h3><p>{session ? `Your ${ownedItems.find((item) => item.category === product.category)?.name || 'current item'} may still cover the same need.` : 'If your current item still works, maintaining it is a valid recommendation.'}</p><button onClick={() => navigate('/dashboard')}>Check what I own <Icon name="arrow" size={15} /></button></div></article>
-            {substitutes.map((item) => <article className="substitute-card" key={item.id} onClick={() => navigate(`/product/${item.id}`)}><ProductVisual product={item} /><div><small>{item.categoryLabel}</small><h3>{item.name}</h3><span><RatingStars rating={item.rating} size="small" /> {item.rating} · {monthsToWords(item.lifespanMonths)}</span><p>{item.summary}</p><button>Compare evidence <Icon name="arrow" size={14} /></button></div></article>)}
+            {substitutes.map((item) => <article className="substitute-card" key={item.id} onClick={() => navigate(`/product/${item.id}`)}><ProductVisual product={item} /><div><small>{item.categoryLabel}</small><h3>{item.name}</h3><span><RatingStars rating={hasCommunityRating(item) ? item.rating : null} size="small" /> {hasCommunityRating(item) ? Number(item.rating).toFixed(1) : 'Not yet rated'} · {monthsToWords(item.lifespanMonths)}</span><p>{item.summary}</p><button>Compare evidence <Icon name="arrow" size={14} /></button></div></article>)}
           </div>
         </section>
 
         <section className="spec-section">
-          <div><div className="eyebrow">Objective product record</div><h2>Details, without the sales copy</h2><p>Community-entered facts linked to a manufacturer page. Suggest a correction if something looks wrong.</p><button className="text-link" onClick={() => requireAuth()}><Icon name="edit" size={15} /> Suggest an edit</button></div>
-          <dl>{product.specs.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}<div><dt>Typical price</dt><dd>{formatPrice(product)}</dd></div><div><dt>Expected lifespan</dt><dd>{monthsToWords(product.lifespanMonths)}</dd></div></dl>
+          <div><div className="eyebrow">Official product record</div><h2>Manufacturer specifications</h2><p>These facts, product imagery and warranty details come from official manufacturer sources. Community lifespan and repairability remain blank until real evidence exists.</p><span className="official-source-chip"><Icon name="shield" size={14} /> Official specifications</span>{product.imageSourceUrl && <a className="text-link" href={product.imageSourceUrl} target="_blank" rel="noreferrer"><Icon name="external" size={15} /> View official image source</a>}{product.specSourceUrl && <a className="text-link" href={product.specSourceUrl} target="_blank" rel="noreferrer"><Icon name="external" size={15} /> View specification source</a>}{product.warrantySourceUrl && <a className="text-link" href={product.warrantySourceUrl} target="_blank" rel="noreferrer"><Icon name="external" size={15} /> View warranty source</a>}<small>Source checked {product.specsCheckedAt || '2026-07-11'}</small><button className="text-link" onClick={() => requireAuth()}><Icon name="edit" size={15} /> Suggest a correction</button></div>
+          <dl>{(product.specs || []).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}{product.warranty && <div><dt>Official warranty</dt><dd>{product.warranty}</dd></div>}<div><dt>Official listed price</dt><dd>{formatPrice(product)}</dd></div><div><dt>Expected lifespan</dt><dd>{monthsToWords(product.lifespanMonths)}</dd></div></dl>
         </section>
       </div>
     </main>
@@ -661,14 +702,14 @@ function RecommendationsPage({ session, ownedItems, products, navigate, onSignIn
   if (!session) return <main className="page-shell"><div className="site-width"><AuthGate title="Recommendations with a memory." copy="WorthIt? uses your private ownership history to suggest what may last—and what you may not need at all." onSignIn={onSignIn} /></div></main>;
   const oldItem = ownedItems.find((item) => { try { return calculateLifespanDetails(item, TODAY).remainingLifespanPercentage < 20; } catch { return false; } });
   const notNeeded = products.filter((product) => ownedItems.some((item) => item.category === product.category)).slice(0, 3);
-  const durable = [...products].filter((product) => product.rating >= 4.5).sort((a, b) => b.lifespanMonths - a.lifespanMonths).slice(0, 3);
+  const durable = [...products].filter((product) => hasCommunityRating(product) && product.rating >= 4.5 && product.lifespanMonths).sort((a, b) => numericOrFallback(b.lifespanMonths) - numericOrFallback(a.lifespanMonths)).slice(0, 3);
   return (
     <main className="page-shell recommendations-page"><div className="site-width">
       <div className="page-title-row"><div><div className="eyebrow accent">Personal guidance</div><h1>For you, with reasons.</h1><p>Every suggestion shows the ownership or community signal behind it.</p></div></div>
       <nav className="account-tabs"><button onClick={() => navigate('/dashboard')}>Your things</button><button onClick={() => navigate('/saved')}>Saved products</button><button className="active">Recommendations</button><button onClick={() => navigate('/profile')}>Profile</button></nav>
       {oldItem && <section className="replacement-callout"><span className={`mini-visual palette-${oldItem.palette}`}>{oldItem.glyph}</span><div><div className="eyebrow light">Possible replacement moment</div><h2>Your {oldItem.name} has passed its expected lifespan.</h2><p>It’s marked {oldItem.status.toLowerCase()}. Check repair options before replacing it.</p></div><button className="button button-paper" onClick={() => navigate(`/discover?q=${oldItem.categoryLabel}`)}>Explore carefully <Icon name="arrow" size={15} /></button></section>}
       <section className="section compact-section"><SectionHeading eyebrow="Products you may not need" title="Good products, familiar jobs" description="These overlap with an active category on your private shelf." /><div className="product-grid three-up">{notNeeded.map((product) => <ProductCard key={product.id} product={product} navigate={navigate} saved={savedIds.includes(product.id)} onSave={onSave} showPersonal ownedItems={ownedItems} />)}</div></section>
-      <section className="section compact-section"><SectionHeading eyebrow="Long-lasting alternatives" title="Community favourites with staying power" description="High owner ratings, long expected life, and enough reviews to be useful." /><div className="product-grid three-up">{durable.map((product) => <ProductCard key={product.id} product={product} navigate={navigate} saved={savedIds.includes(product.id)} onSave={onSave} />)}</div></section>
+      <section className="section compact-section"><SectionHeading eyebrow="Long-lasting alternatives" title="Community favourites with staying power" description="This section appears only when real owner ratings and lifespan evidence are available." />{durable.length ? <div className="product-grid three-up">{durable.map((product) => <ProductCard key={product.id} product={product} navigate={navigate} saved={savedIds.includes(product.id)} onSave={onSave} />)}</div> : <div className="empty-card"><span><Icon name="clock" size={28} /></span><h2>Awaiting long-term evidence.</h2><p>Synthetic demo reviews are not used to fill this recommendation.</p></div>}</section>
     </div></main>
   );
 }
@@ -872,10 +913,10 @@ function ReviewModal({ product, existing, onClose, onSubmit }) {
 function OwnedModal({ product, products, onClose, onSubmit }) {
   const first = product || products[0];
   const [productId, setProductId] = useState(first.id);
-  const [form, setForm] = useState({ purchaseDate: '2025-01-01', purchasePrice: first.price || '', expectedLifespanMonths: first.lifespanMonths || 48, condition: 'Good', status: 'Active', notes: '' });
+  const [form, setForm] = useState({ purchaseDate: '2025-01-01', purchasePrice: first.price ?? '', expectedLifespanMonths: first.lifespanMonths ?? '', condition: 'Good', status: 'Active', notes: '' });
   const selected = products.find((item) => item.id === productId) || first;
-  const submit = (event) => { event.preventDefault(); onSubmit({ ...form, productId: selected.id, name: selected.name, category: selected.category, categoryLabel: selected.categoryLabel, purchasePrice: Number(form.purchasePrice), expectedLifespanMonths: Number(form.expectedLifespanMonths), glyph: selected.glyph, palette: selected.palette, id: `owned-${Date.now()}` }); };
-  return <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}><section className="modal form-modal owned-modal"><button className="modal-close" onClick={onClose}><Icon name="close" /></button><div className="eyebrow accent">Private ownership record</div><h2>Add something you own</h2><p>This information is used for your guidance and is never shown on your public profile.</p><form onSubmit={submit}><label><span>Product *</span><select value={productId} onChange={(e) => { const next = products.find((item) => item.id === e.target.value); setProductId(e.target.value); setForm({ ...form, purchasePrice: next.price, expectedLifespanMonths: next.lifespanMonths }); }}>{products.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.categoryLabel}</option>)}</select></label><div className="field-grid two"><label><span>Purchase date *</span><input required type="date" max={TODAY} value={form.purchaseDate} onChange={(e) => setForm({ ...form, purchaseDate: e.target.value })} /></label><label><span>Purchase price (AUD)</span><input type="number" min="0" value={form.purchasePrice} onChange={(e) => setForm({ ...form, purchasePrice: e.target.value })} /></label><label><span>Expected lifespan (months) *</span><input required type="number" min="1" value={form.expectedLifespanMonths} onChange={(e) => setForm({ ...form, expectedLifespanMonths: e.target.value })} /></label><label><span>Condition *</span><select value={form.condition} onChange={(e) => setForm({ ...form, condition: e.target.value })}><option>Excellent</option><option>Good</option><option>Fair</option><option>Damaged</option></select></label><label className="full-row"><span>Status *</span><select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}><option>Active</option><option>Damaged</option><option>Being repaired</option><option>Replaced</option><option>Sold</option><option>Donated</option><option>Recycled</option><option>Disposed</option></select></label><label className="full-row"><span>Notes</span><textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} placeholder="Repairs, parts replaced, how it is holding up…" /></label></div><div className="review-honesty"><Icon name="lock" size={16} /><span>Private to your account. You can update or remove this at any time.</span></div><button className="button button-ink full" type="submit">Add to your things <Icon name="arrow" size={16} /></button></form></section></div>;
+  const submit = (event) => { event.preventDefault(); onSubmit({ ...form, productId: selected.id, name: selected.name, category: selected.category, categoryLabel: selected.categoryLabel, purchasePrice: form.purchasePrice === '' ? null : Number(form.purchasePrice), expectedLifespanMonths: Number(form.expectedLifespanMonths), glyph: selected.glyph, palette: selected.palette, id: `owned-${Date.now()}` }); };
+  return <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}><section className="modal form-modal owned-modal"><button className="modal-close" onClick={onClose}><Icon name="close" /></button><div className="eyebrow accent">Private ownership record</div><h2>Add something you own</h2><p>This information is used for your guidance and is never shown on your public profile.</p><form onSubmit={submit}><label><span>Product *</span><select value={productId} onChange={(e) => { const next = products.find((item) => item.id === e.target.value); setProductId(e.target.value); setForm({ ...form, purchasePrice: next.price ?? '', expectedLifespanMonths: next.lifespanMonths ?? '' }); }}>{products.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.categoryLabel}</option>)}</select></label><div className="field-grid two"><label><span>Purchase date *</span><input required type="date" max={TODAY} value={form.purchaseDate} onChange={(e) => setForm({ ...form, purchaseDate: e.target.value })} /></label><label><span>Purchase price (AUD)</span><input type="number" min="0" value={form.purchasePrice} onChange={(e) => setForm({ ...form, purchasePrice: e.target.value })} /></label><label><span>Your expected lifespan (months) *</span><input required type="number" min="1" value={form.expectedLifespanMonths} onChange={(e) => setForm({ ...form, expectedLifespanMonths: e.target.value })} placeholder="Enter your own estimate" /></label><label><span>Condition *</span><select value={form.condition} onChange={(e) => setForm({ ...form, condition: e.target.value })}><option>Excellent</option><option>Good</option><option>Fair</option><option>Damaged</option></select></label><label className="full-row"><span>Status *</span><select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}><option>Active</option><option>Damaged</option><option>Being repaired</option><option>Replaced</option><option>Sold</option><option>Donated</option><option>Recycled</option><option>Disposed</option></select></label><label className="full-row"><span>Notes</span><textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} placeholder="Repairs, parts replaced, how it is holding up…" /></label></div><div className="review-honesty"><Icon name="lock" size={16} /><span>Private to your account. Unknown catalogue lifespan values are never replaced with an invented default.</span></div><button className="button button-ink full" type="submit">Add to your things <Icon name="arrow" size={16} /></button></form></section></div>;
 }
 
 function Toast({ toast, onClose }) {
@@ -902,6 +943,34 @@ function App() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [toast, setToast] = useState(null);
   const pendingAction = useRef(null);
+
+  const displayProducts = useMemo(() => products.map((product) => {
+    const localCommunityReviews = userReviews.filter((review) => review.productId === product.id && !review.isSynthetic && review.provenance !== 'synthetic_demo');
+    if (!localCommunityReviews.length) return product;
+
+    const baseReviewCount = Number(product.reviewCount || 0);
+    const baseRatingTotal = hasCommunityRating(product) ? Number(product.rating) * baseReviewCount : 0;
+    const reviewCount = baseReviewCount + localCommunityReviews.length;
+    const ratingTotal = localCommunityReviews.reduce((sum, review) => sum + Number(review.rating || 0), baseRatingTotal);
+    const distribution = [...(product.distribution || [0, 0, 0, 0, 0])];
+    localCommunityReviews.forEach((review) => {
+      const ratingIndex = Math.max(0, Math.min(4, Math.round(Number(review.rating || 1)) - 1));
+      distribution[ratingIndex] = (distribution[ratingIndex] || 0) + 1;
+    });
+    const currentOwnerReviews = localCommunityReviews.filter((review) => review.relationship === 'Currently own it');
+    const longTermReviews = localCommunityReviews.filter((review) => Number(review.ownershipMonths) >= 24 && !['Briefly tested it', 'Do not own it'].includes(review.relationship));
+    const buyAgainResponses = localCommunityReviews.filter((review) => typeof review.wouldBuyAgain === 'boolean');
+
+    return {
+      ...product,
+      rating: reviewCount ? ratingTotal / reviewCount : null,
+      reviewCount,
+      distribution,
+      owners: Number(product.owners || 0) + currentOwnerReviews.length,
+      longTermOwners: Number(product.longTermOwners || 0) + longTermReviews.length,
+      buyAgain: buyAgainResponses.length ? Math.round(buyAgainResponses.filter((review) => review.wouldBuyAgain).length / buyAgainResponses.length * 100) : product.buyAgain,
+    };
+  }), [products, userReviews]);
 
   useEffect(() => {
     const onHash = () => { setRoute(getRoute()); setMobileOpen(false); window.scrollTo({ top: 0, behavior: 'instant' }); };
@@ -946,7 +1015,7 @@ function App() {
   const submitReview = (data) => {
     const existing = userReviews.find((review) => review.productId === reviewProduct.id);
     const activeUser = session || currentUser;
-    const review = { ...data, id: existing?.id || `user-review-${Date.now()}`, productId: reviewProduct.id, userId: activeUser.id, user: activeUser.displayName, initials: activeUser.initials, ownershipMonths: 0, helpful: existing?.helpful || 0, comments: existing?.comments || 0, date: new Date().toISOString(), demo: false, commercialRelationship: false };
+    const review = { ...data, id: existing?.id || `user-review-${Date.now()}`, productId: reviewProduct.id, userId: activeUser.id, user: activeUser.displayName, initials: activeUser.initials, ownershipMonths: 0, helpful: existing?.helpful || 0, comments: existing?.comments || 0, date: new Date().toISOString(), demo: false, isSynthetic: false, provenance: 'user_submitted_local', commercialRelationship: false };
     const next = [review, ...userReviews.filter((item) => item.productId !== reviewProduct.id)]; setUserReviews(next); window.localStorage.setItem(STORAGE.reviews, JSON.stringify(next)); setReviewProduct(null); setToast({ message: existing ? 'Your experience was updated.' : 'Your experience is now part of this local demo.' });
   };
   const toggleHelpful = (reviewId) => { setHelpfulIds((ids) => ids.includes(reviewId) ? ids.filter((id) => id !== reviewId) : [...ids, reviewId]); setToast({ message: helpfulIds.includes(reviewId) ? 'Helpful vote removed.' : 'Marked as helpful.' }); };
@@ -955,20 +1024,20 @@ function App() {
   const addProduct = (product) => { setProducts((items) => [product, ...items]); setToast({ message: `${product.name} was submitted for community validation.` }); };
 
   let content;
-  if (route.path === '/') content = <HomePage navigate={navigate} products={products} savedIds={savedIds} onSave={toggleSave} session={session} ownedItems={ownedItems} />;
-  else if (route.path === '/discover') content = <DiscoverPage route={route} navigate={navigate} products={products} savedIds={savedIds} onSave={toggleSave} session={session} ownedItems={ownedItems} />;
-  else if (route.path === '/community') content = <CommunityPage navigate={navigate} products={products} onContribute={() => requireAuth(() => navigate('/contribute'))} />;
+  if (route.path === '/') content = <HomePage navigate={navigate} products={displayProducts} savedIds={savedIds} onSave={toggleSave} session={session} ownedItems={ownedItems} />;
+  else if (route.path === '/discover') content = <DiscoverPage route={route} navigate={navigate} products={displayProducts} savedIds={savedIds} onSave={toggleSave} session={session} ownedItems={ownedItems} />;
+  else if (route.path === '/community') content = <CommunityPage navigate={navigate} products={displayProducts} onContribute={() => requireAuth(() => navigate('/contribute'))} />;
   else if (route.path.startsWith('/product/')) {
-    const product = products.find((item) => item.id === route.path.split('/')[2]);
+    const product = displayProducts.find((item) => item.id === route.path.split('/')[2]);
     content = product ? <ProductPage product={product} navigate={navigate} savedIds={savedIds} onSave={toggleSave} session={session} ownedItems={ownedItems} requireAuth={requireAuth} onOpenReview={setReviewProduct} onOpenOwned={openOwned} userReviews={userReviews} helpfulIds={helpfulIds} onHelpful={toggleHelpful} onComment={addComment} onReport={reportReview} /> : <div className="site-width empty-card page-empty"><h1>Product not found</h1><button className="button button-ink" onClick={() => navigate('/discover')}>Browse the catalogue</button></div>;
   } else if (route.path === '/dashboard') content = <DashboardPage session={session} ownedItems={ownedItems} navigate={navigate} onSignIn={() => requireAuth(() => navigate('/dashboard'))} onAdd={() => requireAuth(() => openOwned())} onRemove={removeOwned} />;
-  else if (route.path === '/saved') content = <SavedPage session={session} products={products} savedIds={savedIds} onSave={toggleSave} navigate={navigate} onSignIn={() => requireAuth(() => navigate('/saved'))} ownedItems={ownedItems} />;
-  else if (route.path === '/recommendations') content = <RecommendationsPage session={session} ownedItems={ownedItems} products={products} navigate={navigate} onSignIn={() => requireAuth(() => navigate('/recommendations'))} savedIds={savedIds} onSave={toggleSave} />;
-  else if (route.path === '/contribute') content = <ContributePage session={session} products={products} onSignIn={() => requireAuth(() => navigate('/contribute'))} navigate={navigate} onProductAdded={addProduct} />;
+  else if (route.path === '/saved') content = <SavedPage session={session} products={displayProducts} savedIds={savedIds} onSave={toggleSave} navigate={navigate} onSignIn={() => requireAuth(() => navigate('/saved'))} ownedItems={ownedItems} />;
+  else if (route.path === '/recommendations') content = <RecommendationsPage session={session} ownedItems={ownedItems} products={displayProducts} navigate={navigate} onSignIn={() => requireAuth(() => navigate('/recommendations'))} savedIds={savedIds} onSave={toggleSave} />;
+  else if (route.path === '/contribute') content = <ContributePage session={session} products={displayProducts} onSignIn={() => requireAuth(() => navigate('/contribute'))} navigate={navigate} onProductAdded={addProduct} />;
   else if (route.path === '/profile') content = <ProfilePage session={session} navigate={navigate} onSignIn={() => requireAuth(() => navigate('/profile'))} reviewCount={userReviews.length} />;
   else if (route.path === '/guidelines') content = <TextPage type="guidelines" navigate={navigate} />;
   else if (route.path === '/privacy') content = <TextPage type="privacy" navigate={navigate} />;
-  else content = <HomePage navigate={navigate} products={products} savedIds={savedIds} onSave={toggleSave} session={session} ownedItems={ownedItems} />;
+  else content = <HomePage navigate={navigate} products={displayProducts} savedIds={savedIds} onSave={toggleSave} session={session} ownedItems={ownedItems} />;
 
   return (
     <div className="app">
@@ -978,7 +1047,7 @@ function App() {
       <Footer navigate={navigate} />
       <AuthModal open={authOpen} onClose={() => { setAuthOpen(false); pendingAction.current = null; }} onVerified={verified} />
       {reviewProduct && <ReviewModal product={reviewProduct} existing={userReviews.find((review) => review.productId === reviewProduct.id)} onClose={() => setReviewProduct(null)} onSubmit={submitReview} />}
-      {ownedModalOpen && <OwnedModal product={ownedProduct} products={products.filter((product) => product.rating > 0)} onClose={() => { setOwnedModalOpen(false); setOwnedProduct(null); }} onSubmit={addOwned} />}
+      {ownedModalOpen && <OwnedModal product={ownedProduct} products={displayProducts} onClose={() => { setOwnedModalOpen(false); setOwnedProduct(null); }} onSubmit={addOwned} />}
       <Toast toast={toast} onClose={() => setToast(null)} />
     </div>
   );

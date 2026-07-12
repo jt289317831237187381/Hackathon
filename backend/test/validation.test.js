@@ -82,12 +82,12 @@ test('credential registration and login inputs normalize and validate', () => {
 
 test('catalog query parsing validates bounds, duplicates and categories', () => {
   const parsed = parseCatalogQuery(
-    { q: ' kettle ', minPrice: '10', maxPrice: '200', limit: '5' },
+    { q: ' breville ', minPrice: '10', maxPrice: '1000', limit: '5' },
     ['kitchen']
   );
-  assert.equal(parsed.q, 'kettle');
+  assert.equal(parsed.q, 'breville');
   assert.equal(parsed.minPrice, 10);
-  assert.equal(parsed.maxPrice, 200);
+  assert.equal(parsed.maxPrice, 1000);
   assert.equal(parsed.limit, 5);
 
   assert.throws(
@@ -106,21 +106,21 @@ test('catalog query parsing validates bounds, duplicates and categories', () => 
 
 test('ownership creation accepts only canonical, bounded fields', () => {
   const result = validateOwnershipCreate({
-    productId: 'morrow-k2',
+    productId: 'breville-bes875',
     purchaseDate: '2024-01-01',
-    purchasePrice: 119,
-    expectedLifespanMonths: 84,
+    purchasePrice: 749,
+    expectedLifespanMonths: 96,
     condition: 'Good',
     status: 'Active',
     notes: '  Replaced the seal once.  ',
   });
-  assert.equal(result.productId, 'morrow-k2');
+  assert.equal(result.productId, 'breville-bes875');
   assert.equal(result.notes, 'Replaced the seal once.');
 
   assert.throws(
     () =>
       validateOwnershipCreate({
-        productId: 'morrow-k2',
+        productId: 'breville-bes875',
         purchaseDate: '2024-01-01',
         expectedLifespanMonths: -5,
       }),
@@ -130,7 +130,7 @@ test('ownership creation accepts only canonical, bounded fields', () => {
   assert.throws(
     () =>
       validateOwnershipCreate({
-        productId: 'morrow-k2',
+        productId: 'breville-bes875',
         purchaseDate: '2024-01-01',
         admin: true,
       }),

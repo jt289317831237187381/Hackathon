@@ -98,7 +98,7 @@ function request({ method = 'GET', url, body, headers = {} }) {
   });
 }
 
-test('public catalog, search and product detail routes expose labelled fixtures', async () => {
+test('public catalog exposes real official products and labelled synthetic reviews', async () => {
   const health = await request({ url: '/api/health' });
   assert.equal(health.status, 200);
   assert.equal(health.json.productionReady, false);
@@ -108,27 +108,55 @@ test('public catalog, search and product detail routes expose labelled fixtures'
   });
   assert.equal(catalog.status, 200);
   assert.equal(catalog.json.meta.isDemoData, true);
+  assert.equal(catalog.json.meta.productDataIsReal, true);
+  assert.equal(
+    catalog.json.meta.productProvenance,
+    'official_manufacturer_website'
+  );
+  assert.equal(
+    catalog.json.meta.syntheticReviewsExcludedFromCommunityMetrics,
+    true
+  );
   assert.equal(catalog.json.products.length, 2);
   assert.ok(
-    catalog.json.products[0].expectedLifespanMonths >=
-      catalog.json.products[1].expectedLifespanMonths
+    catalog.json.products.every(
+      (product) =>
+        product.isRealProduct === true &&
+        product.isDemoData === false &&
+        product.communityRating === null &&
+        product.reviewCount === 0
+    )
   );
 
   const missingQuery = await request({ url: '/api/search' });
   assert.equal(missingQuery.status, 400);
   assert.equal(missingQuery.json.error.details.field, 'q');
 
-  const search = await request({ url: '/api/search?q=kettle' });
+  const search = await request({ url: '/api/search?q=breville' });
   assert.equal(search.status, 200);
   assert.deepEqual(
     search.json.products.map((product) => product.id),
-    ['morrow-k2']
+    ['breville-bes875']
   );
 
-  const detail = await request({ url: '/api/products/morrow-k2' });
+  const detail = await request({ url: '/api/products/breville-bes875' });
   assert.equal(detail.status, 200);
   assert.equal(detail.json.meta.isDemoData, true);
-  assert.ok(detail.json.reviews.every((review) => review.isDemoData === true));
+  assert.equal(detail.json.product.isRealProduct, true);
+  assert.equal(detail.json.product.isDemoData, false);
+  assert.equal(detail.json.product.communityRating, null);
+  assert.equal(detail.json.product.reviewCount, 0);
+  assert.equal(detail.json.reviews.length, 8);
+  assert.ok(
+    detail.json.reviews.every(
+      (review) =>
+        review.isDemoData === true &&
+        review.isSynthetic === true &&
+        review.provenance === 'synthetic_demo' &&
+        /synthetic/i.test(review.title) &&
+        /synthetic/i.test(review.reviewText)
+    )
+  );
   assert.equal('redditRating' in detail.json, false);
 });
 
@@ -201,15 +229,17 @@ test('development OTP creates a scoped ownership session and score', async (t) =
     url: '/api/ownership',
     headers: { authorization },
     body: {
-      productId: 'morrow-k2',
+      productId: 'breville-bes875',
       purchaseDate: '2025-01-01',
+      expectedLifespanMonths: 96,
       condition: 'Good',
       status: 'Active',
     },
   });
   assert.equal(created.status, 201);
-  assert.equal(created.json.item.productId, 'morrow-k2');
-  assert.equal(created.json.item.expectedLifespanMonths, 84);
+  assert.equal(created.json.item.productId, 'breville-bes875');
+  assert.equal(created.json.item.expectedLifespanMonths, 96);
+  assert.equal(created.json.item.lifespan.expectedLifespanMonths, 96);
 
   const ownership = await request({
     url: '/api/ownership',
@@ -219,7 +249,7 @@ test('development OTP creates a scoped ownership session and score', async (t) =
   assert.equal(ownership.json.total, 1);
 
   const score = await request({
-    url: '/api/products/morrow-k2/purchase-score',
+    url: '/api/products/breville-bes875/purchase-score',
     headers: { authorization },
   });
   assert.equal(score.status, 200);

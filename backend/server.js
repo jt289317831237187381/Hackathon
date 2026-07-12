@@ -52,6 +52,9 @@ function getAllowedOrigins() {
 function demoMeta(extra = {}) {
   return {
     isDemoData: true,
+    productDataIsReal: true,
+    productProvenance: 'official_manufacturer_website',
+    syntheticReviewsExcludedFromCommunityMetrics: true,
     notice: DEMO_DATA_NOTICE,
     ...extra,
   };
@@ -166,13 +169,25 @@ function sortCatalog(products, sort) {
   const sorted = [...products];
   const numberOr = (value, fallback) =>
     Number.isFinite(value) ? value : fallback;
+  const dateOr = (value, fallback) => {
+    const timestamp = value ? new Date(value).getTime() : NaN;
+    return Number.isFinite(timestamp) ? timestamp : fallback;
+  };
+  const releaseTimestamp = (product) => {
+    const releaseDate = dateOr(product.releaseDate, null);
+    if (releaseDate !== null) return releaseDate;
+    return Number.isInteger(product.releaseYear)
+      ? Date.UTC(product.releaseYear, 0, 1)
+      : Number.NEGATIVE_INFINITY;
+  };
 
   sorted.sort((left, right) => {
     let comparison = 0;
 
     switch (sort) {
       case 'most-reviewed':
-        comparison = right.reviewCount - left.reviewCount;
+        comparison =
+          numberOr(right.reviewCount, 0) - numberOr(left.reviewCount, 0);
         break;
       case 'highest-rated':
         comparison =
@@ -180,21 +195,28 @@ function sortCatalog(products, sort) {
           numberOr(left.communityRating, -1);
         break;
       case 'recently-added':
-        comparison = new Date(right.createdAt) - new Date(left.createdAt);
+        comparison =
+          dateOr(right.createdAt, Number.NEGATIVE_INFINITY) -
+          dateOr(left.createdAt, Number.NEGATIVE_INFINITY);
         break;
       case 'newest-release':
-        comparison = new Date(right.releaseDate) - new Date(left.releaseDate);
+        comparison = releaseTimestamp(right) - releaseTimestamp(left);
         break;
       case 'longest-lifespan':
         comparison =
-          right.expectedLifespanMonths - left.expectedLifespanMonths;
+          numberOr(right.expectedLifespanMonths, Number.NEGATIVE_INFINITY) -
+          numberOr(left.expectedLifespanMonths, Number.NEGATIVE_INFINITY);
         break;
       case 'most-saved':
-        comparison = right.demoSavedCount - left.demoSavedCount;
+        comparison =
+          numberOr(right.demoSavedCount, 0) -
+          numberOr(left.demoSavedCount, 0);
         break;
       case 'trending':
       default:
-        comparison = left.trendingRank - right.trendingRank;
+        comparison =
+          numberOr(left.trendingRank, Number.POSITIVE_INFINITY) -
+          numberOr(right.trendingRank, Number.POSITIVE_INFINITY);
         break;
     }
 
@@ -229,12 +251,16 @@ function queryCatalog(filters) {
   }
   if (filters.minPrice !== undefined) {
     products = products.filter(
-      (product) => product.currentPrice >= filters.minPrice
+      (product) =>
+        Number.isFinite(product.currentPrice) &&
+        product.currentPrice >= filters.minPrice
     );
   }
   if (filters.maxPrice !== undefined) {
     products = products.filter(
-      (product) => product.currentPrice <= filters.maxPrice
+      (product) =>
+        Number.isFinite(product.currentPrice) &&
+        product.currentPrice <= filters.maxPrice
     );
   }
   if (filters.minRating !== undefined) {
@@ -252,12 +278,15 @@ function queryCatalog(filters) {
   if (filters.minLifespanMonths !== undefined) {
     products = products.filter(
       (product) =>
+        Number.isFinite(product.expectedLifespanMonths) &&
         product.expectedLifespanMonths >= filters.minLifespanMonths
     );
   }
   if (filters.minRepairability !== undefined) {
     products = products.filter(
-      (product) => product.repairabilityRating >= filters.minRepairability
+      (product) =>
+        Number.isFinite(product.repairabilityRating) &&
+        product.repairabilityRating >= filters.minRepairability
     );
   }
 
@@ -280,18 +309,27 @@ function getSubstitutes(product, limit = 3) {
     .sort((left, right) => {
       const ratingDifference =
         (right.communityRating || 0) - (left.communityRating || 0);
+      const rightLifespan = Number.isFinite(right.expectedLifespanMonths)
+        ? right.expectedLifespanMonths
+        : Number.NEGATIVE_INFINITY;
+      const leftLifespan = Number.isFinite(left.expectedLifespanMonths)
+        ? left.expectedLifespanMonths
+        : Number.NEGATIVE_INFINITY;
       return (
         ratingDifference ||
-        right.expectedLifespanMonths - left.expectedLifespanMonths
+        rightLifespan - leftLifespan ||
+        left.name.localeCompare(right.name)
       );
     })
     .slice(0, limit)
     .map((candidate) => ({
       ...candidate,
       reason:
-        candidate.expectedLifespanMonths > product.expectedLifespanMonths
-          ? 'Same demo category with a longer stated expected lifespan.'
-          : 'Same demo category with community-written demonstration reviews.',
+        Number.isFinite(candidate.expectedLifespanMonths) &&
+        (!Number.isFinite(product.expectedLifespanMonths) ||
+          candidate.expectedLifespanMonths > product.expectedLifespanMonths)
+          ? 'Same category with a longer evidence-backed expected lifespan.'
+          : 'Same category with specifications linked to an official manufacturer source.',
     }));
 }
 
@@ -370,7 +408,7 @@ function createApp() {
     res.json({
       status: 'ok',
       service: 'WorthIt? local-development API',
-      dataMode: 'demonstration-fixtures',
+      dataMode: 'official-product-catalog-with-synthetic-review-fixtures',
       productionReady: false,
     });
   });

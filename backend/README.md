@@ -1,8 +1,10 @@
 # WorthIt? local-development API
 
-This Express API supports an honest, self-contained WorthIt? hackathon demo. It does not scrape Reddit or any external review source. Its 15 products, 32 reviews, reviewer identities, counts and activity are fictional development fixtures and every API response containing them is labelled `isDemoData: true`.
+This Express API supports an honest, self-contained WorthIt? hackathon demo. Its catalog contains 15 real products available in the Australian market, with official manufacturer product, specification, price, warranty and release source URLs where available. AUD prices are point-in-time snapshots checked on 2026-07-11, not live quotes.
 
-Do not deploy the fixtures as real community content.
+The shared product source is [`frontend/src/data/productCatalog.json`](../frontend/src/data/productCatalog.json). Catalog records are returned as real product data with `isRealProduct: true`, `isDemoData: false` and `provenance: "official_manufacturer_website"`. `backend/data.json` remains solely the local store for users and ownership records; it does not store products or reviews.
+
+The API does not scrape Reddit or any external review source. Its 120 generated synthetic review scenarios—eight per product—exist only to exercise review-oriented UI and API paths. They are explicitly marked `isDemoData: true`, `isSynthetic: true` and `provenance: "synthetic_demo"`, and are excluded from community ratings and review counts. They are not real customer testimony and must not be deployed as community content.
 
 ## Run locally
 
@@ -107,17 +109,19 @@ Example ownership body:
 
 ```json
 {
-  "productId": "morrow-k2",
+  "productId": "breville-bes875",
   "purchaseDate": "2024-01-01",
-  "purchasePrice": 119,
-  "expectedLifespanMonths": 84,
+  "purchasePrice": 749,
+  "expectedLifespanMonths": 96,
   "userAdjustedLifespanMonths": null,
   "condition": "Good",
   "status": "Active",
   "lastUsedAt": "2026-07-10",
-  "notes": "Replaced the lid seal once."
+  "notes": "Replaced the group-head seal once."
 }
 ```
+
+The 96-month expected lifespan in this example is the owner's estimate for their specific item, not a manufacturer claim.
 
 The purchase score implements the prompt's deterministic 0–100 formula in `scoring.js`, returns all positive and negative factors, identifies the owned item used in the calculation, and always includes the financial-guidance disclaimer.
 
@@ -128,14 +132,14 @@ npm run check
 npm test
 ```
 
-Tests use Node's built-in test runner and cover phone-verified registration, username/email login, salted scrypt records, login throttling, OTP flow isolation, production OTP safeguards, malformed tokens, input validation, fixture labelling, community aggregation, lifespan calculations, scoring thresholds and score clamping.
+Tests use Node's built-in test runner and cover phone-verified registration, username/email login, salted scrypt records, login throttling, OTP flow isolation, production OTP safeguards, malformed tokens, input validation, fixture labelling, exclusion of synthetic reviews from community aggregation, lifespan calculations, scoring thresholds and score clamping.
 
 ## Deliberate limitations
 
 This backend is a local, single-process demonstration—not production infrastructure:
 
-- Product and review reads come from in-code fictional fixtures.
-- User and ownership data use a local atomic JSON file. There is no multi-process locking, migration system, backup strategy or Row Level Security.
+- Product reads come from the shared real-product catalog in `frontend/src/data/productCatalog.json`; its official-source URLs and 2026-07-11 AUD price snapshots are static and require manual rechecking. Review reads include 120 clearly labelled generated synthetic scenarios, which are excluded from community ratings and review counts.
+- User and ownership data alone use the local atomic `data.json` file. There is no multi-process locking, migration system, backup strategy or Row Level Security.
 - Bearer tokens are local HMAC tokens without revocation.
 - OTP challenges and pending registrations are in memory and no SMS is sent. A server restart invalidates both.
 - Review submission, voting, discussion, reports and moderation writes are not implemented here.
